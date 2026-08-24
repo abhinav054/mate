@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import difflib
 import errno
-import fcntl
 import json
 import os
 import pty
@@ -11,7 +10,6 @@ import shlex
 import shutil
 import signal
 import subprocess
-import termios
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -53,6 +51,10 @@ GIT_MUTATING_COMMANDS = {
 
 def _workspace() -> Path:
     return ACTIVE_WORKSPACE
+
+
+def _bash_command(command: str) -> list[str]:
+    return [BASH_EXECUTABLE, "-lc", command]
 
 
 def _set_workspace(path: str | os.PathLike[str]) -> Path:
@@ -161,15 +163,6 @@ def _append_background_pty_output(process_id: str, master_fd: int) -> None:
             if entry:
                 entry["output"].append(f"[pty] {pending.rstrip()}")
                 entry["output"] = entry["output"][-600:]
-
-
-def _make_controlling_terminal(slave_fd: int) -> Callable[[], None]:
-    def configure_child() -> None:
-        os.setsid()
-        fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
-        os.tcsetpgrp(slave_fd, os.getpgrp())
-
-    return configure_child
 
 
 def _process_tty_status(pid: int) -> str:
@@ -546,10 +539,8 @@ def run_command(command: str, cwd: str = ".", max_time_seconds: int = 30) -> str
 
     try:
         result = subprocess.run(
-            command,
+            _bash_command(command),
             cwd=workdir,
-            shell=True,
-            executable=BASH_EXECUTABLE,
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -604,22 +595,15 @@ def start_background_process(command: str, cwd: str = ".", process_id: str | Non
     master_fd, slave_fd = pty.openpty()
     try:
         process = subprocess.Popen(
-            command,
+            _bash_command(command),
             cwd=workdir,
-            shell=True,
-            executable=BASH_EXECUTABLE,
             stdin=slave_fd,
             stdout=slave_fd,
             stderr=slave_fd,
             text=False,
-            preexec_fn=_make_controlling_terminal(slave_fd),
             close_fds=True,
             bufsize=0,
         )
-        try:
-            os.tcsetpgrp(master_fd, process.pid)
-        except OSError:
-            pass
     finally:
         os.close(slave_fd)
     entry = {
@@ -697,7 +681,13 @@ def stop_background_process(process_id: str, signal_name: str = "TERM") -> str:
     if normalized not in {"TERM", "INT", "KILL"}:
         raise ValueError("signal_name must be TERM, INT, or KILL")
     sig = {"TERM": signal.SIGTERM, "INT": signal.SIGINT, "KILL": signal.SIGKILL}[normalized]
-    os.killpg(process.pid, sig)
+    try:
+        if os.getpgid(process.pid) == process.pid:
+            os.killpg(process.pid, sig)
+        else:
+            process.send_signal(sig)
+    except ProcessLookupError:
+        return f"{process_id} already exited"
     try:
         process.wait(timeout=5)
     except subprocess.TimeoutExpired:
@@ -912,10 +902,8 @@ def run_plugin_hook(plugin_name: str, hook_command: str, input_json: str = "{}",
     env["MATE_PLUGIN_ROOT"] = str(plugin_root)
     env["PYTHONPATH"] = f"{plugin_root.parent}:{plugin_root}:{env.get('PYTHONPATH', '')}"
     result = subprocess.run(
-        hook_command,
+        _bash_command(hook_command),
         cwd=_workspace(),
-        shell=True,
-        executable=BASH_EXECUTABLE,
         input=input_json,
         capture_output=True,
         text=True,

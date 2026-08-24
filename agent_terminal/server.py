@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import json
 import os
+import random
+import re
+import time
 from dataclasses import dataclass
 from typing import Any
 
-from openai import OpenAI
+from openai import OpenAI, RateLimitError
 
 from . import config as mate_config
 from . import version as mate_version
@@ -24,6 +27,39 @@ def _json_arguments(value: str | None) -> dict[str, Any]:
     if not isinstance(parsed, dict):
         raise ValueError("tool arguments must be a JSON object")
     return parsed
+
+
+def _response_headers(exc: Exception) -> dict[str, str]:
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    if not headers:
+        return {}
+    return {str(key).lower(): str(value) for key, value in headers.items()}
+
+
+def _parse_duration_seconds(value: str | None) -> float | None:
+    if not value:
+        return None
+    text = value.strip().lower()
+    try:
+        return max(0.0, float(text))
+    except ValueError:
+        pass
+    match = re.fullmatch(r"(?:(\d+(?:\.\d+)?)h)?(?:(\d+(?:\.\d+)?)m)?(?:(\d+(?:\.\d+)?)s)?", text)
+    if not match:
+        return None
+    hours, minutes, seconds = (float(part) if part else 0.0 for part in match.groups())
+    return max(0.0, hours * 3600 + minutes * 60 + seconds)
+
+
+def _rate_limit_retry_delay(exc: RateLimitError, attempt: int) -> float:
+    headers = _response_headers(exc)
+    for header in ("retry-after", "x-ratelimit-reset-tokens", "x-ratelimit-reset-requests"):
+        parsed = _parse_duration_seconds(headers.get(header))
+        if parsed is not None:
+            return min(parsed, 120.0)
+    fallback = min(2.0**attempt, 30.0)
+    return fallback + random.uniform(0.0, min(1.0, fallback * 0.1))
 
 
 def describe_tool_start(name: str, arguments: dict[str, Any]) -> str:
@@ -285,7 +321,8 @@ class AgentServer:
     def _run_agent_until_answer(self) -> str:
         while True:
             with self.ui.working("Mate is thinking"):
-                response = self.client.chat.completions.create(
+                response = self._create_chat_completion_with_retry(
+                    label="model request",
                     model=self.model,
                     messages=self.messages,
                     tools=tools.TOOL_DEFINITIONS,
@@ -342,7 +379,8 @@ class AgentServer:
         return answer
 
     def _assess_answer(self, user_goal: str, answer: str) -> dict[str, Any]:
-        response = self.client.chat.completions.create(
+        response = self._create_chat_completion_with_retry(
+            label="result check",
             model=self.model,
             messages=[
                 {
@@ -367,6 +405,23 @@ class AgentServer:
             response_format={"type": "json_object"},
         )
         return _extract_json_object(response.choices[0].message.content or "{}")
+
+    def _create_chat_completion_with_retry(self, label: str, **kwargs: Any) -> Any:
+        max_retries = max(0, int(os.getenv("AGENT_MODEL_RATE_LIMIT_RETRIES", "4")))
+        for attempt in range(max_retries + 1):
+            try:
+                return self.client.chat.completions.create(**kwargs)
+            except RateLimitError as exc:
+                if attempt >= max_retries:
+                    raise
+                delay = _rate_limit_retry_delay(exc, attempt)
+                self.ui.activity(
+                    "Rate limited",
+                    f"{label}; retrying in {self.ui.format_duration(delay)}",
+                    self.ui.YELLOW,
+                )
+                time.sleep(delay)
+        raise RuntimeError("unreachable rate-limit retry state")
 
 
 def _extract_json_object(value: str) -> dict[str, Any]:
