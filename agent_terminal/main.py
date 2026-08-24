@@ -61,6 +61,7 @@ def _print_help() -> None:
         "- /reset: clear conversation history except the base system prompt and steering\n"
         "- /resources [kind]: list copied resources; kind can be all, agents, skills, commands, hooks, plugins\n"
         "- /backgrounds: list background processes started in this session\n"
+        "- /<command> [args]: run a copied slash command, for example /commit or /feature-dev auth flow\n"
         "- exit or quit: close Mate\n"
         "\nShell commands and mutating Git commands require approval before they run.\n",
     )
@@ -122,6 +123,25 @@ def _handle_runtime_command(server: AgentServer, user_input: str) -> bool:
     return False
 
 
+def _expand_slash_command(user_input: str) -> str | None:
+    if not user_input.startswith("/") or user_input == "/":
+        return None
+    command_with_args = user_input[1:].strip()
+    if not command_with_args:
+        return None
+    command_name, _, arguments = command_with_args.partition(" ")
+    try:
+        command_prompt = tools.load_command(command_name)
+    except FileNotFoundError:
+        return None
+    if command_prompt.startswith("Multiple commands matched:"):
+        UI.panel("Command", command_prompt, UI.YELLOW)
+        return ""
+    if arguments.strip():
+        return f"{command_prompt}\n\nUser supplied slash-command arguments:\n{arguments.strip()}"
+    return command_prompt
+
+
 def main() -> None:
     args = _parse_args()
     workspace = _resolve_workspace(args)
@@ -144,6 +164,11 @@ def main() -> None:
             continue
         if _handle_runtime_command(server, user_input):
             continue
+        expanded_command = _expand_slash_command(user_input)
+        if expanded_command == "":
+            continue
+        if expanded_command is not None:
+            user_input = expanded_command
 
         started = time.monotonic()
         try:

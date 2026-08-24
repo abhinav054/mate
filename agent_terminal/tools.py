@@ -26,6 +26,7 @@ BACKGROUND_PROCESSES: dict[str, dict[str, Any]] = {}
 BACKGROUND_LOCK = threading.Lock()
 APPROVAL_REQUIRED_TOOLS = {"run_command", "start_background_process"}
 ACTIVE_WORKSPACE = Path.cwd().resolve()
+BASH_EXECUTABLE = shutil.which("bash") or "/bin/bash"
 GIT_MUTATING_COMMANDS = {
     "add",
     "am",
@@ -166,8 +167,34 @@ def _make_controlling_terminal(slave_fd: int) -> Callable[[], None]:
     def configure_child() -> None:
         os.setsid()
         fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
+        os.tcsetpgrp(slave_fd, os.getpgrp())
 
     return configure_child
+
+
+def _process_tty_status(pid: int) -> str:
+    stat_path = Path(f"/proc/{pid}/stat")
+    try:
+        stat = stat_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return "tty=? tpgid=?"
+    fields = stat.rsplit(") ", 1)[1].split()
+    try:
+        tty_nr = int(fields[4])
+        tpgid = int(fields[5])
+    except (IndexError, ValueError):
+        return "tty=? tpgid=?"
+    tty_name = "?"
+    fd_path = Path(f"/proc/{pid}/fd/0")
+    try:
+        target = os.readlink(fd_path)
+    except OSError:
+        target = ""
+    if target.startswith("/dev/"):
+        tty_name = target.removeprefix("/dev/")
+    elif tty_nr > 0:
+        tty_name = str(tty_nr)
+    return f"tty={tty_name} tpgid={tpgid}"
 
 
 def _background_entry(process_id: str) -> dict[str, Any]:
@@ -522,6 +549,7 @@ def run_command(command: str, cwd: str = ".", max_time_seconds: int = 30) -> str
             command,
             cwd=workdir,
             shell=True,
+            executable=BASH_EXECUTABLE,
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -579,6 +607,7 @@ def start_background_process(command: str, cwd: str = ".", process_id: str | Non
             command,
             cwd=workdir,
             shell=True,
+            executable=BASH_EXECUTABLE,
             stdin=slave_fd,
             stdout=slave_fd,
             stderr=slave_fd,
@@ -587,6 +616,10 @@ def start_background_process(command: str, cwd: str = ".", process_id: str | Non
             close_fds=True,
             bufsize=0,
         )
+        try:
+            os.tcsetpgrp(master_fd, process.pid)
+        except OSError:
+            pass
     finally:
         os.close(slave_fd)
     entry = {
@@ -605,7 +638,10 @@ def start_background_process(command: str, cwd: str = ".", process_id: str | Non
         args=(normalized_id, master_fd),
         daemon=True,
     ).start()
-    return f"started {normalized_id} pid={process.pid}"
+    return (
+        f"started {normalized_id} pid={process.pid}\n"
+        f"To read stdout/stderr, call read_background_process with process_id={normalized_id}."
+    )
 
 
 def list_background_processes() -> str:
@@ -617,7 +653,10 @@ def list_background_processes() -> str:
         process = entry["process"]
         return_code = process.poll()
         status = "running" if return_code is None else f"exited({return_code})"
-        rows.append(f"{process_id}\t{status}\tpid={process.pid}\tcwd={entry['cwd']}\t{entry['command']}")
+        tty_status = _process_tty_status(process.pid)
+        rows.append(
+            f"{process_id}\t{status}\tpid={process.pid}\t{tty_status}\tcwd={entry['cwd']}\t{entry['command']}"
+        )
     return "\n".join(rows) if rows else "(empty)"
 
 
@@ -876,6 +915,7 @@ def run_plugin_hook(plugin_name: str, hook_command: str, input_json: str = "{}",
         hook_command,
         cwd=_workspace(),
         shell=True,
+        executable=BASH_EXECUTABLE,
         input=input_json,
         capture_output=True,
         text=True,

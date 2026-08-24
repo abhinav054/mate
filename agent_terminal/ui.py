@@ -52,15 +52,24 @@ class TerminalUI:
         if not cls.enabled():
             return value
 
+        urls: list[str] = []
+
+        def protect_url(match: re.Match[str]) -> str:
+            urls.append(match.group(0))
+            return f"\0URL{len(urls) - 1}\0"
+
         def command(match: re.Match[str]) -> str:
             return cls.style(match.group(0), cls.THEME["command"], cls.BOLD)
 
         def path(match: re.Match[str]) -> str:
             return cls.style(match.group(0), cls.THEME["path"])
 
+        value = re.sub(r"https?://[^\s)>\]}\"']+", protect_url, value)
         value = re.sub(r"`[^`]+`", command, value)
-        value = re.sub(r"(?<![\w`])(?:\.{1,2}/|/|~\/)[\w./@%+=:, -]+", path, value)
-        value = re.sub(r"\b[\w.-]+/[\w./@%+=:,-]+", path, value)
+        path_pattern = r"(?<![\w`:])(?:\.{1,2}/|/|~\/)[\w./@%+=:,-]+|\b[\w.-]+/[\w./@%+=:,-]+"
+        value = re.sub(path_pattern, path, value)
+        for index, url in enumerate(urls):
+            value = value.replace(f"\0URL{index}\0", url)
         return value
 
     @classmethod
