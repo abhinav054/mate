@@ -102,19 +102,52 @@ prompt_if_missing() {
   local default_value="${3:-}"
   local secret="${4:-0}"
   local current_value="${!var_name:-}"
+  local tty=""
 
   if [[ -n "$current_value" ]]; then
     return
   fi
 
+  if [[ -r /dev/tty && -w /dev/tty ]]; then
+    tty="/dev/tty"
+  elif [[ "$secret" == "1" && -z "$default_value" ]]; then
+    echo "$prompt is required. Pass it with --api-key or set $var_name." >&2
+    exit 1
+  fi
+
   if [[ "$secret" == "1" ]]; then
-    read -rsp "$prompt: " current_value
-    echo
+    if [[ -n "$tty" ]]; then
+      read -rsp "$prompt: " current_value < "$tty" || {
+        echo "Could not read $prompt." >&2
+        exit 1
+      }
+      echo > "$tty"
+    else
+      read -rsp "$prompt: " current_value || {
+        echo "Could not read $prompt." >&2
+        exit 1
+      }
+      echo
+    fi
   elif [[ -n "$default_value" ]]; then
-    read -rp "$prompt [$default_value]: " current_value
+    if [[ -n "$tty" ]]; then
+      read -rp "$prompt [$default_value]: " current_value < "$tty" || current_value=""
+    else
+      read -rp "$prompt [$default_value]: " current_value || current_value=""
+    fi
     current_value="${current_value:-$default_value}"
   else
-    read -rp "$prompt: " current_value
+    if [[ -n "$tty" ]]; then
+      read -rp "$prompt: " current_value < "$tty" || {
+        echo "Could not read $prompt." >&2
+        exit 1
+      }
+    else
+      read -rp "$prompt: " current_value || {
+        echo "Could not read $prompt." >&2
+        exit 1
+      }
+    fi
   fi
 
   printf -v "$var_name" '%s' "$current_value"
