@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-AGENTS_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
+AGENTS_HOME="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 WORKSPACE="${1:-}"
 
 if [[ -n "$WORKSPACE" && ! -d "$WORKSPACE" ]]; then

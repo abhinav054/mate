@@ -10,28 +10,19 @@ loads reusable commands, agents, hooks, and skills from `agent_resources`.
 
 ## Install
 
-Download the latest installer and run it:
+Download the installer and run it:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/abhinav054/mate/main/scripts/install_latest_mate.sh | bash -s -- \
+curl -fsSL https://raw.githubusercontent.com/abhinav054/mate/main/scripts/install_mate.sh | bash -s -- \
   --api-key your-key \
   --base-url https://api.openai.com/v1 \
   --model gpt-4.1-mini
 ```
 
-From a checked-out repo, run the latest-release installer directly:
+From a checked-out repo, run the installer directly:
 
 ```bash
-./scripts/install_latest_mate.sh \
-  --api-key your-key \
-  --base-url https://api.openai.com/v1 \
-  --model gpt-4.1-mini
-```
-
-You can also install the latest release through `install_mate.sh`:
-
-```bash
-./install_mate.sh \
+./scripts/install_mate.sh \
   --api-key your-key \
   --base-url https://api.openai.com/v1 \
   --model gpt-4.1-mini
@@ -274,7 +265,6 @@ bash -n run_agent.sh
 bash -n install_agent.sh
 bash -n scripts/release_github.sh
 bash -n scripts/install_mate.sh
-bash -n scripts/install_latest_mate.sh
 scripts/release_github.sh
 ```
 

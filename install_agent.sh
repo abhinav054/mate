@@ -4,7 +4,8 @@ if [ -z "${BASH_VERSION:-}" ]; then
 fi
 set -euo pipefail
 
-AGENTS_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
+AGENTS_HOME="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 OPENAI_API_KEY="${OPENAI_API_KEY:-}"
 OPENAI_BASE_URL="${OPENAI_BASE_URL:-}"

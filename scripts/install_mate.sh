@@ -143,9 +143,9 @@ else
   echo "Downloading Mate tarball:"
   echo "  $RELEASE_URL"
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$RELEASE_URL" -o "$TMP_DIR/mate.tar.gz"
+    curl --fail --show-error --location --progress-bar "$RELEASE_URL" -o "$TMP_DIR/mate.tar.gz"
   elif command -v wget >/dev/null 2>&1; then
-    wget -qO "$TMP_DIR/mate.tar.gz" "$RELEASE_URL"
+    wget --show-progress -O "$TMP_DIR/mate.tar.gz" "$RELEASE_URL"
   else
     echo "Install curl or wget, then rerun this installer." >&2
     exit 1

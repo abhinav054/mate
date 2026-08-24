@@ -4,7 +4,8 @@ if [ -z "${BASH_VERSION:-}" ]; then
 fi
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
+ROOT_DIR="$(cd "$(dirname "$SCRIPT_PATH")/.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 DIST_DIR="$ROOT_DIR/dist"
 PACKAGE_DIR="$ROOT_DIR"
@@ -53,7 +54,6 @@ cp "$ROOT_DIR/README.md" "$ARCHIVE_ROOT/README.md"
 cp "$ROOT_DIR/run_agent.sh" "$ARCHIVE_ROOT/run_agent.sh"
 cp "$ROOT_DIR/install_agent.sh" "$ARCHIVE_ROOT/install_agent.sh"
 cp "$ROOT_DIR/scripts/install_mate.sh" "$ARCHIVE_ROOT/install_mate.sh"
-cp "$ROOT_DIR/scripts/install_latest_mate.sh" "$ARCHIVE_ROOT/install_latest_mate.sh"
 find "$ARCHIVE_ROOT" -type d \( -name __pycache__ -o -name .build-venv \) -prune -exec rm -rf {} +
 find "$ARCHIVE_ROOT" -type f -name '*.pyc' -delete
 rm -f "$ARCHIVE_ROOT/.env" "$ARCHIVE_ROOT/.mate/keys.env"
