@@ -54,6 +54,8 @@ def describe_tool_start(name: str, arguments: dict[str, Any]) -> str:
         return f"Start background: {arguments.get('command', '(missing command)')}  cwd={cwd}"
     if name == "read_background_process":
         return f"Read background output: {arguments.get('process_id', '(missing id)')}"
+    if name == "write_background_process":
+        return f"Write background input: {arguments.get('process_id', '(missing id)')}"
     if name == "stop_background_process":
         return f"Stop background process: {arguments.get('process_id', '(missing id)')}"
     if name == "list_background_processes":
@@ -108,6 +110,7 @@ def tool_action_name(name: str) -> str:
         "run_command": "Ran shell command",
         "start_background_process": "Started background process",
         "read_background_process": "Read background output",
+        "write_background_process": "Wrote background input",
         "stop_background_process": "Stopped background process",
         "list_background_processes": "Listed background processes",
         "request_user_input": "Asked for input",
@@ -190,7 +193,7 @@ class AgentServer:
                 "Use the git tool for Git status, diff, log, branch, show, add, commit, restore, and related operations instead of run_command. "
                 "Use check_system_tools when a copied plugin depends on external CLIs. "
                 "When you start or identify a workspace server, record it with record_workspace_server; run_command also records common server commands automatically in .codex/workspace-servers.jsonl. "
-                "Use start_background_process for long-running servers or watchers, then list_background_processes, read_background_process, and stop_background_process to manage them. "
+                "Use start_background_process for long-running servers or watchers, then list_background_processes, read_background_process, write_background_process, and stop_background_process to manage them. "
                 "Whenever required information is missing from the user, such as database URLs, API keys, credentials, tokens, deployment settings, or important product choices, use request_user_input to ask for it in the terminal UI, then proceed with the answer or implementation. Use secret=true for sensitive values. "
                 "Before changing files, inspect relevant files when they exist. "
                 "Use run_command for tests, formatting, and project inspection. "

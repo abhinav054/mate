@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import difflib
+import errno
+import fcntl
 import json
 import os
+import pty
+import select
 import shlex
 import shutil
 import signal
 import subprocess
+import termios
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -113,6 +118,56 @@ def _append_background_output(process_id: str, stream: Any, stream_name: str) ->
             entry["output"].append(f"[{stream_name}] {line.rstrip()}")
             entry["output"] = entry["output"][-600:]
     stream.close()
+
+
+def _append_background_pty_output(process_id: str, master_fd: int) -> None:
+    pending = ""
+    while True:
+        try:
+            readable, _, _ = select.select([master_fd], [], [], 0.2)
+            if not readable:
+                with BACKGROUND_LOCK:
+                    entry = BACKGROUND_PROCESSES.get(process_id)
+                    process = entry["process"] if entry else None
+                if not entry or process.poll() is not None:
+                    break
+                continue
+            chunk = os.read(master_fd, 4096)
+        except OSError as exc:
+            if exc.errno in {errno.EIO, errno.EBADF}:
+                break
+            raise
+        if not chunk:
+            break
+        pending += chunk.decode(errors="replace")
+        lines = pending.splitlines(keepends=True)
+        if lines and not lines[-1].endswith(("\n", "\r")):
+            pending = lines.pop()
+        else:
+            pending = ""
+        if not lines:
+            continue
+        with BACKGROUND_LOCK:
+            entry = BACKGROUND_PROCESSES.get(process_id)
+            if not entry:
+                break
+            for line in lines:
+                entry["output"].append(f"[pty] {line.rstrip()}")
+            entry["output"] = entry["output"][-600:]
+    if pending:
+        with BACKGROUND_LOCK:
+            entry = BACKGROUND_PROCESSES.get(process_id)
+            if entry:
+                entry["output"].append(f"[pty] {pending.rstrip()}")
+                entry["output"] = entry["output"][-600:]
+
+
+def _make_controlling_terminal(slave_fd: int) -> Callable[[], None]:
+    def configure_child() -> None:
+        os.setsid()
+        fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
+
+    return configure_child
 
 
 def _background_entry(process_id: str) -> dict[str, Any]:
@@ -518,34 +573,36 @@ def start_background_process(command: str, cwd: str = ".", process_id: str | Non
     if _looks_like_server_command(command):
         record_workspace_server(command, cwd)
 
-    process = subprocess.Popen(
-        command,
-        cwd=workdir,
-        shell=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=True,
-        bufsize=1,
-    )
+    master_fd, slave_fd = pty.openpty()
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=workdir,
+            shell=True,
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            text=False,
+            preexec_fn=_make_controlling_terminal(slave_fd),
+            close_fds=True,
+            bufsize=0,
+        )
+    finally:
+        os.close(slave_fd)
     entry = {
         "command": command,
         "cwd": "." if workdir == _workspace() else str(workdir.relative_to(_workspace())),
         "created_at": datetime.now(timezone.utc).isoformat(),
         "process": process,
+        "pty_master_fd": master_fd,
         "output": [],
     }
     with BACKGROUND_LOCK:
         BACKGROUND_PROCESSES[normalized_id] = entry
 
     threading.Thread(
-        target=_append_background_output,
-        args=(normalized_id, process.stdout, "stdout"),
-        daemon=True,
-    ).start()
-    threading.Thread(
-        target=_append_background_output,
-        args=(normalized_id, process.stderr, "stderr"),
+        target=_append_background_pty_output,
+        args=(normalized_id, master_fd),
         daemon=True,
     ).start()
     return f"started {normalized_id} pid={process.pid}"
@@ -577,6 +634,19 @@ def read_background_process(process_id: str, max_lines: int = 120) -> str:
     return _trim_output(f"{header}\n{body}")
 
 
+def write_background_process(process_id: str, input_text: str) -> str:
+    """Write text to a background process PTY."""
+    entry = _background_entry(process_id)
+    process = entry["process"]
+    if process.poll() is not None:
+        return f"{process_id} already exited with code {process.returncode}"
+    master_fd = entry.get("pty_master_fd")
+    if master_fd is None:
+        raise ValueError(f"background process does not have a writable pty: {process_id}")
+    os.write(master_fd, input_text.encode())
+    return f"wrote {len(input_text)} chars to {process_id}"
+
+
 def stop_background_process(process_id: str, signal_name: str = "TERM") -> str:
     """Stop a background process by process id."""
     entry = _background_entry(process_id)
@@ -593,6 +663,12 @@ def stop_background_process(process_id: str, signal_name: str = "TERM") -> str:
         process.wait(timeout=5)
     except subprocess.TimeoutExpired:
         return f"sent SIG{normalized} to {process_id}; process is still running"
+    master_fd = entry.get("pty_master_fd")
+    if master_fd is not None:
+        try:
+            os.close(master_fd)
+        except OSError:
+            pass
     return f"sent SIG{normalized} to {process_id}; exited with code {process.returncode}"
 
 
@@ -834,6 +910,7 @@ TOOLS: dict[str, Callable[..., str]] = {
     "start_background_process": start_background_process,
     "list_background_processes": list_background_processes,
     "read_background_process": read_background_process,
+    "write_background_process": write_background_process,
     "stop_background_process": stop_background_process,
     "request_user_input": request_user_input,
     "search_files": search_files,
@@ -1079,6 +1156,24 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     },
                 },
                 "required": ["process_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_background_process",
+            "description": "Write text to a running background process PTY.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "process_id": {"type": "string", "description": "Background process id."},
+                    "input_text": {
+                        "type": "string",
+                        "description": "Text to send to the process. Include a newline when submitting a command.",
+                    },
+                },
+                "required": ["process_id", "input_text"],
             },
         },
     },
