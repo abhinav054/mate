@@ -244,6 +244,40 @@ quote_env_value() {
   printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
 }
 
+add_bin_dir_to_path() {
+  local shell_rc
+  local path_line
+
+  case ":$PATH:" in
+    *":$BIN_DIR:"*) return ;;
+  esac
+
+  export PATH="$BIN_DIR:$PATH"
+  path_line="export PATH=\"$BIN_DIR:\$PATH\""
+
+  if [[ -n "${HOME:-}" && -d "$HOME" ]]; then
+    if [[ -n "${BASH_VERSION:-}" ]]; then
+      shell_rc="$HOME/.bashrc"
+    else
+      shell_rc="$HOME/.profile"
+    fi
+
+    touch "$shell_rc"
+    if ! grep -Fqx "$path_line" "$shell_rc"; then
+      {
+        echo ""
+        echo "# Added by Mate installer"
+        echo "$path_line"
+      } >> "$shell_rc"
+      echo "Added $BIN_DIR to PATH in $shell_rc."
+    else
+      echo "$BIN_DIR is already configured in $shell_rc."
+    fi
+  else
+    echo "Add $BIN_DIR to PATH if the mate command is not found."
+  fi
+}
+
 echo "Preparing install directories:"
 echo "  install: $INSTALL_DIR"
 echo "  bin: $BIN_DIR"
@@ -317,7 +351,4 @@ echo "Mate installed successfully."
 echo "Run: $BIN_DIR/mate"
 echo "Config: $INSTALL_DIR/.mate"
 
-case ":$PATH:" in
-  *":$BIN_DIR:"*) ;;
-  *) echo "Add $BIN_DIR to PATH if the mate command is not found." ;;
-esac
+add_bin_dir_to_path
