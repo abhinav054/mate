@@ -53,13 +53,27 @@ def _parse_duration_seconds(value: str | None) -> float | None:
 
 
 def _rate_limit_retry_delay(exc: RateLimitError, attempt: int) -> float:
+    max_delay = max(0.0, float(os.getenv("AGENT_MODEL_RATE_LIMIT_MAX_DELAY_SECONDS", "30")))
+    header_delay = _rate_limit_header_delay(exc)
+    if header_delay is not None:
+        return min(header_delay, max_delay)
+    fallback = min(2.0**attempt, max_delay)
+    return fallback + random.uniform(0.0, min(1.0, fallback * 0.1))
+
+
+def _rate_limit_header_delay(exc: RateLimitError) -> float | None:
     headers = _response_headers(exc)
     for header in ("retry-after", "x-ratelimit-reset-tokens", "x-ratelimit-reset-requests"):
         parsed = _parse_duration_seconds(headers.get(header))
         if parsed is not None:
-            return min(parsed, 120.0)
-    fallback = min(2.0**attempt, 30.0)
-    return fallback + random.uniform(0.0, min(1.0, fallback * 0.1))
+            return parsed
+    return None
+
+
+def _rate_limit_status(exc: RateLimitError) -> int | None:
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    return int(status_code) if isinstance(status_code, int) else None
 
 
 def describe_tool_start(name: str, arguments: dict[str, Any]) -> str:
@@ -407,14 +421,40 @@ class AgentServer:
         return _extract_json_object(response.choices[0].message.content or "{}")
 
     def _create_chat_completion_with_retry(self, label: str, **kwargs: Any) -> Any:
-        max_retries = max(0, int(os.getenv("AGENT_MODEL_RATE_LIMIT_RETRIES", "4")))
+        max_retries = max(0, int(os.getenv("AGENT_MODEL_RATE_LIMIT_RETRIES", "2")))
+        max_wait_seconds = max(0.0, float(os.getenv("AGENT_MODEL_RATE_LIMIT_MAX_WAIT_SECONDS", "60")))
+        retry_long_after = os.getenv("AGENT_MODEL_RATE_LIMIT_RETRY_LONG_AFTER", "").lower() in {"1", "true", "yes"}
+        retry_started = time.monotonic()
         for attempt in range(max_retries + 1):
             try:
                 return self.client.chat.completions.create(**kwargs)
             except RateLimitError as exc:
+                headers = _response_headers(exc)
+                status_code = _rate_limit_status(exc)
+                if status_code is None and not headers:
+                    self.ui.activity(
+                        "Rate limited",
+                        f"{label}; no HTTP response details, not retrying",
+                        self.ui.YELLOW,
+                    )
+                    raise
                 if attempt >= max_retries:
                     raise
+                header_delay = _rate_limit_header_delay(exc)
                 delay = _rate_limit_retry_delay(exc, attempt)
+                elapsed = time.monotonic() - retry_started
+                remaining_budget = max(0.0, max_wait_seconds - elapsed)
+                budget_delay = header_delay if header_delay is not None else delay
+                if elapsed + budget_delay > max_wait_seconds and not retry_long_after:
+                    self.ui.activity(
+                        "Rate limited",
+                        (
+                            f"{label}; retry-after exceeds local budget "
+                            f"({self.ui.format_duration(budget_delay)} > {self.ui.format_duration(remaining_budget)})"
+                        ),
+                        self.ui.YELLOW,
+                    )
+                    raise
                 self.ui.activity(
                     "Rate limited",
                     f"{label}; retrying in {self.ui.format_duration(delay)}",

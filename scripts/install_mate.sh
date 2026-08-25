@@ -13,6 +13,7 @@ SOURCE_DIR="${SOURCE_DIR:-}"
 OPENAI_API_KEY="${OPENAI_API_KEY:-}"
 OPENAI_BASE_URL="${OPENAI_BASE_URL:-}"
 OPENAI_MODEL="${OPENAI_MODEL:-}"
+WORKDIR="${WORKDIR:-$PWD}"
 
 usage() {
   echo "Usage: $0 [--release-url URL | --source-dir DIR] [--install-dir DIR] [--bin-dir DIR] [--api-key KEY] [--base-url URL] [--model MODEL]"
@@ -61,6 +62,86 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+opaque_value() {
+  local value="$1"
+
+  if [[ -z "$value" ]]; then
+    printf '<empty>'
+  elif [[ ${#value} -le 8 ]]; then
+    printf '<opaque>'
+  else
+    printf '%s...%s' "${value:0:4}" "${value: -4}"
+  fi
+}
+
+log_model_config() {
+  local source="$1"
+
+  echo "Reading model config from $source:"
+  echo "  OPENAI_API_KEY=$(opaque_value "$OPENAI_API_KEY")"
+  echo "  OPENAI_BASE_URL=${OPENAI_BASE_URL:-<empty>}"
+  echo "  OPENAI_MODEL=${OPENAI_MODEL:-<empty>}"
+}
+
+load_model_config_file() {
+  local env_file="$1"
+  local line key value
+
+  [[ -f "$env_file" ]] || return 1
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -n "$line" && "${line:0:1}" != "#" && "$line" == *=* ]] || continue
+
+    key="${line%%=*}"
+    value="${line#*=}"
+    key="${key#export }"
+    key="${key#"${key%%[![:space:]]*}"}"
+    key="${key%"${key##*[![:space:]]}"}"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    value="${value%\"}"
+    value="${value#\"}"
+    value="${value%\'}"
+    value="${value#\'}"
+
+    case "$key" in
+      OPENAI_API_KEY|OPENAI_BASE_URL|OPENAI_MODEL)
+        printf -v "$key" '%s' "$value"
+        ;;
+    esac
+  done < "$env_file"
+
+  return 0
+}
+
+load_existing_model_config() {
+  local config_file
+  local config_files=(
+    "$INSTALL_DIR/.mate/keys.env"
+    "$HOME/.local/share/mate/.mate/keys.env"
+    "$HOME/.mate/keys.env"
+    "$WORKDIR/.mate/keys.env"
+  )
+
+  if [[ -n "${OPENAI_API_KEY:-}" || -n "${OPENAI_BASE_URL:-}" || -n "${OPENAI_MODEL:-}" ]]; then
+    log_model_config "env"
+    return
+  fi
+
+  for config_file in "${config_files[@]}"; do
+    if load_model_config_file "$config_file"; then
+      echo "Found Mate settings:"
+      echo "  $config_file"
+      log_model_config "$config_file"
+      return
+    fi
+  done
+
+  echo "No existing OpenAI-compatible model config found; prompting for settings."
+}
+
 latest_release_url() {
   local release_metadata release_metadata_url release_url
 
@@ -95,6 +176,8 @@ if [[ -z "$SOURCE_DIR" && -z "$RELEASE_URL" ]]; then
     exit 1
   fi
 fi
+
+load_existing_model_config
 
 prompt_if_missing() {
   local var_name="$1"
