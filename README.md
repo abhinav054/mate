@@ -8,24 +8,33 @@ results.
 Mate keeps its behavior configurable through a repo-local `.mate` directory and
 loads reusable commands, agents, hooks, and skills from `agent_resources`.
 
+Mate runs on Node.js. Install Node.js 20 or newer before installing Mate.
+
 ## Install
 
-Download the installer and run it:
+Install globally from a checked-out repo:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/abhinav054/mate/main/scripts/install_mate.sh | bash -s -- \
-  --api-key your-key \
-  --base-url https://api.openai.com/v1 \
-  --model gpt-4.1-mini
+npm install -g .
 ```
 
-From a checked-out repo, run the installer directly:
+Or install a published package:
 
 ```bash
-./scripts/install_mate.sh \
-  --api-key your-key \
-  --base-url https://api.openai.com/v1 \
-  --model gpt-4.1-mini
+npm install -g mate
+```
+
+Configure your model in `~/.mate/keys.env`, your shell environment, or a local
+`.env` file:
+
+```bash
+mkdir -p ~/.mate
+cat > ~/.mate/keys.env <<'EOF'
+OPENAI_API_KEY='your-key'
+OPENAI_BASE_URL='https://api.openai.com/v1'
+OPENAI_MODEL='gpt-4.1-mini'
+EOF
+chmod 600 ~/.mate/keys.env
 ```
 
 To build the Docker image and run Mate against the current directory:
@@ -40,11 +49,11 @@ To run only the install smoke test:
 scripts/docker_local.sh --smoke
 ```
 
-By default this resolves the latest release bundle tarball. To pin a specific
-release tarball:
+By default this installs the package from the current checkout inside the test
+image. To pin a package tarball or registry spec:
 
 ```bash
-RELEASE_URL=https://github.com/abhinav054/mate/releases/download/vX.Y.Z/mate-X.Y.Z-bundle.tar.gz \
+PACKAGE_SPEC=mate@X.Y.Z \
   scripts/docker_local.sh
 ```
 
@@ -61,9 +70,6 @@ The helper reads `OPENAI_API_KEY`, `OPENAI_BASE_URL`, and `OPENAI_MODEL` from
 the root `.env` file, then `.mate/keys.env`, and passes them into the container.
 Environment variables already set in your shell take precedence. Set `ENV_FILE`
 or `MATE_KEYS_FILE` to read another file.
-
-The installer saves model settings to Mate home. Any missing value is read from
-the matching environment variable first, then prompted interactively.
 
 Environment fallback names are `OPENAI_API_KEY`, `OPENAI_BASE_URL`, and
 `OPENAI_MODEL`.
@@ -84,7 +90,7 @@ mate --workspace /path/to/workspace
 
 If you omit the workspace, Mate creates a fresh temporary workspace under `/tmp`.
 
-The bundled wrapper sets the repo-local config paths for you:
+For local development, the bundled wrapper sets repo-local config paths:
 
 ```bash
 ./run_agent.sh /path/to/workspace
@@ -106,8 +112,9 @@ Inside Mate:
 
 ## Configuration
 
-Mate loads configuration from `.mate` through `MATE_HOME`. The bundled
-`run_agent.sh` sets `MATE_HOME` to the repo-local `.mate` directory.
+Mate loads configuration from `~/.mate` by default, or from another directory
+when `MATE_HOME` is set. The bundled `run_agent.sh` sets `MATE_HOME` to the
+repo-local `.mate` directory.
 
 ```text
 .mate/
@@ -127,7 +134,7 @@ auto_approve = false
 require_tools = ["run_command", "start_background_process"]
 allow_tools = ["list_files", "glob_files", "read_file", "search_files"]
 allow_commands = ["pwd", "ls", "ls *", "rg *", "git status*", "git diff*"]
-require_commands = ["pip install *", "npm install*", "git push*"]
+require_commands = ["npm install*", "git push*"]
 
 [model]
 api_key_env = "OPENAI_API_KEY"
@@ -148,7 +155,7 @@ approval prompt is transient, so after you answer the terminal keeps only a shor
 confirmation line:
 
 ```text
-✔ You approved Mate to run `python -m pip install xgboost` this time
+✔ You approved Mate to run `npm install` this time
 ```
 
 Read-only commands such as `ls`, `rg`, `git status`, and `git diff` can be
@@ -168,16 +175,6 @@ Example stdio server:
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/workspace"]
 env = { LOG_LEVEL = "info" }
-```
-
-Example local service:
-
-```toml
-[servers.docs]
-command = "python"
-args = ["-m", "my_docs_mcp"]
-cwd = "/path/to/docs-server"
-env = { DOCS_ROOT = "/path/to/docs" }
 ```
 
 Example remote HTTP server:
@@ -235,12 +232,12 @@ with Mate releases.
 ## Project Layout
 
 ```text
-agent_terminal/          Python package
+src/                     Node.js agent runtime
 agent_resources/         bundled commands, agents, hooks, and skills
 .mate/                   local Mate config
+package.json             npm package and mate bin entry
 scripts/                 release and installer scripts
 run_agent.sh             local wrapper
-install_agent.sh         local editable installer
 ```
 
 ## Contributing
@@ -248,30 +245,17 @@ install_agent.sh         local editable installer
 For local development from a checked-out repo, run:
 
 ```bash
-./install_agent.sh \
-  --api-key your-key \
-  --base-url https://api.openai.com/v1 \
-  --model gpt-4.1-mini
+npm install
+npm install -g .
 ```
-
-The local installer creates `.venv`, installs Mate in editable mode, and saves
-model settings to `.mate/keys.env`.
 
 Build and verify locally:
 
 ```bash
-python -m compileall agent_terminal
+npm run smoke
 bash -n run_agent.sh
-bash -n install_agent.sh
 bash -n scripts/release_github.sh
-bash -n scripts/install_mate.sh
 scripts/release_github.sh
-```
-
-For local testing, install from a checked-out source folder:
-
-```bash
-./scripts/install_mate.sh --source-dir /path/to/mate --api-key your-key --base-url https://api.openai.com/v1
 ```
 
 ## Merge Requests

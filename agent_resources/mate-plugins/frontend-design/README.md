@@ -24,8 +24,3 @@ Mate will choose a clear aesthetic direction and implement production code with 
 ## Learn More
 
 See the [Frontend Aesthetics Cookbook](https://github.com/anthropics/mate-cookbooks/blob/main/coding/prompting_for_frontend_aesthetics.ipynb) for detailed guidance on prompting for high-quality frontend design.
-
-## Authors
-
-Prithvi Rajasekaran (prithvi@anthropic.com)
-Alexander Bricken (alexander@anthropic.com)

@@ -1,10 +1,1 @@
-hookify/skills/writing-rules/SKILL.md
 frontend-design/skills/frontend-design/SKILL.md
-plugin-dev/skills/hook-development/SKILL.md
-plugin-dev/skills/command-development/SKILL.md
-plugin-dev/skills/agent-development/SKILL.md
-plugin-dev/skills/skill-development/SKILL.md
-plugin-dev/skills/plugin-structure/SKILL.md
-plugin-dev/skills/plugin-settings/SKILL.md
-plugin-dev/skills/mcp-integration/SKILL.md
-mate--4-5-migration/skills/mate--4-5-migration/SKILL.md

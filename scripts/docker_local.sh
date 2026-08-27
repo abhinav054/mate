@@ -4,10 +4,11 @@ if [ -z "${BASH_VERSION:-}" ]; then
 fi
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
+ROOT_DIR="$(cd "$(dirname "$SCRIPT_PATH")/.." && pwd)"
 IMAGE_TAG="${IMAGE_TAG:-mate-release-test}"
 REPO="${REPO:-abhinav054/mate}"
-RELEASE_URL="${RELEASE_URL:-}"
+PACKAGE_SPEC="${PACKAGE_SPEC:-/tmp/mate-package}"
 WORKSPACE_DIR="${WORKSPACE_DIR:-$PWD}"
 ENV_FILE="${ENV_FILE:-$ROOT_DIR/.env}"
 MATE_KEYS_FILE="${MATE_KEYS_FILE:-$ROOT_DIR/.mate/keys.env}"
@@ -63,44 +64,14 @@ else
   OPENAI_API_KEY_DISPLAY="<empty>"
 fi
 
-latest_release_url() {
-  local release_metadata release_metadata_url release_url
+RELEASE_CACHE_KEY="$PACKAGE_SPEC"
 
-  if ! command -v curl >/dev/null 2>&1; then
-    echo "curl is required to discover the latest Mate release." >&2
-    return 1
-  fi
-
-  release_metadata_url="https://github.com/$REPO/releases/latest/download/latest-release.txt"
-  if ! release_metadata="$(curl -fsSL "$release_metadata_url" 2>/dev/null)"; then
-    echo "Could not download latest release metadata: $release_metadata_url" >&2
-    return 1
-  fi
-
-  release_url="$(printf '%s\n' "$release_metadata" | sed -n 's/^bundle_url=//p' | head -n 1)"
-  if [[ -z "$release_url" ]]; then
-    echo "Latest release metadata did not include bundle_url." >&2
-    return 1
-  fi
-  if [[ "$release_url" != *-bundle.tar.gz ]]; then
-    echo "Latest release metadata bundle_url is not a bundle tarball: $release_url" >&2
-    return 1
-  fi
-
-  printf '%s\n' "$release_url"
-}
-
-if [[ -z "$RELEASE_URL" ]]; then
-  RELEASE_URL="$(latest_release_url)"
-fi
-RELEASE_CACHE_KEY="$RELEASE_URL"
-
-echo "Building Docker image from Mate tarball:"
-echo "  $RELEASE_URL"
+echo "Building Docker image with npm global install:"
+echo "  $PACKAGE_SPEC"
 
 docker build \
   -f "$ROOT_DIR/docker_test/Dockerfile" \
-  --build-arg "RELEASE_URL=$RELEASE_URL" \
+  --build-arg "PACKAGE_SPEC=$PACKAGE_SPEC" \
   --build-arg "RELEASE_CACHE_KEY=$RELEASE_CACHE_KEY" \
   -t "$IMAGE_TAG" \
   "$ROOT_DIR"

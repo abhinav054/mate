@@ -405,8 +405,6 @@ Let the workflow guide you through all 7 phases.
 
 ## Author
 
-Sid Bidasaria (sbidasaria@anthropic.com)
-
 ## Version
 
 1.0.0

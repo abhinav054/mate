@@ -1,0 +1,27 @@
+{
+  "name": "mate",
+  "version": "0.1.0",
+  "description": "Mate, a small OpenAI-compatible terminal coding companion with local file tools and curl-based browsing.",
+  "type": "module",
+  "files": [
+    "src",
+    "agent_resources",
+    "README.md",
+    "run_agent.sh"
+  ],
+  "bin": {
+    "mate": "src/main.js",
+    "agent-terminal": "src/main.js"
+  },
+  "scripts": {
+    "start": "node src/main.js",
+    "check": "npm run smoke",
+    "smoke": "node --check src/main.js && node --check src/server.js && node --check src/tools.js && node --check src/config.js && node --check src/ui.js"
+  },
+  "dependencies": {
+    "openai": "^4.104.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

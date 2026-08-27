@@ -1,29 +1,22 @@
-FROM python:3.12-slim
+FROM node:20-slim
 
-ARG RELEASE_URL="https://github.com/abhinav054/mate/archive/refs/heads/main.tar.gz"
-ARG RELEASE_CACHE_KEY="$RELEASE_URL"
+ARG PACKAGE_SPEC="/tmp/mate-package"
+ARG RELEASE_CACHE_KEY="$PACKAGE_SPEC"
 
-ENV PATH="/opt/mate/bin:${PATH}" \
-    MATE_HOME="/opt/mate/app/.mate" \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+ENV MATE_HOME="/root/.mate"
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl ca-certificates git \
     && rm -rf /var/lib/apt/lists/*
 
+COPY [".", "/tmp/mate-package"]
+
 RUN set -eux; \
     echo "$RELEASE_CACHE_KEY" > /tmp/mate-release-cache-key; \
-    curl -fsSL https://raw.githubusercontent.com/abhinav054/mate/main/scripts/install_mate.sh -o /tmp/install_mate.sh; \
-    bash /tmp/install_mate.sh \
-      --release-url "$RELEASE_URL" \
-      --install-dir /opt/mate/app \
-      --bin-dir /opt/mate/bin \
-      --api-key test-key \
-      --base-url https://api.openai.com/v1 \
-      --model gpt-4.1-mini; \
-    test -x /opt/mate/bin/mate; \
-    /opt/mate/app/.venv/bin/python -c "import agent_terminal"
+    npm install -g "$PACKAGE_SPEC"; \
+    mkdir -p "$MATE_HOME"; \
+    test -x "$(command -v mate)"; \
+    node --check "$(npm root -g)/mate/src/main.js"
 
 COPY ["docker_test/docker-entrypoint.sh", "/usr/local/bin/mate-docker-entrypoint"]
 RUN chmod +x /usr/local/bin/mate-docker-entrypoint
@@ -31,4 +24,4 @@ RUN chmod +x /usr/local/bin/mate-docker-entrypoint
 WORKDIR /workspace
 
 ENTRYPOINT ["mate-docker-entrypoint"]
-CMD ["bash", "-lc", "test -x /opt/mate/bin/mate && /opt/mate/app/.venv/bin/python -c 'import agent_terminal' && echo 'Mate tarball install smoke test passed.'"]
+CMD ["bash", "-lc", "test -x $(command -v mate) && node --check $(npm root -g)/mate/src/main.js && echo 'Mate npm global install smoke test passed.'"]

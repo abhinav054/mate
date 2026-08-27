@@ -1,15 +1,7 @@
-ralph-wiggum/commands/help.md
-ralph-wiggum/commands/cancel-ralph.md
-ralph-wiggum/commands/ralph-loop.md
-hookify/commands/help.md
-hookify/commands/hookify.md
-hookify/commands/configure.md
-hookify/commands/list.md
+
 pr-review-toolkit/commands/review-pr.md
 commit-commands/commands/commit.md
 commit-commands/commands/commit-push-pr.md
 commit-commands/commands/clean_gone.md
 feature-dev/commands/feature-dev.md
-plugin-dev/commands/create-plugin.md
-agent-sdk-dev/commands/new-sdk-app.md
 code-review/commands/code-review.md

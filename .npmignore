@@ -1,0 +1,15 @@
+.env
+.mate/keys.env
+.venv
+agent_terminal
+agent_terminal.egg-info
+build
+dist
+docker_test
+mate.egg-info
+pyproject.toml
+scripts
+test
+*.tar.gz
+__pycache__
+*.pyc

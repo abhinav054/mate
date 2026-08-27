@@ -5,7 +5,7 @@ quote_env_value() {
   printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
 }
 
-MATE_HOME="${MATE_HOME:-/opt/mate/app/.mate}"
+MATE_HOME="${MATE_HOME:-/root/.mate}"
 mkdir -p "$MATE_HOME"
 
 if [[ -n "${OPENAI_API_KEY:-}" || -n "${OPENAI_BASE_URL:-}" || -n "${OPENAI_MODEL:-}" ]]; then
