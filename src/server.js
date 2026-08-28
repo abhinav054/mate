@@ -90,7 +90,9 @@ export class AgentServer {
         const rows = [String(prompt || "").trim() || "Input required"];
         if (defaultValue !== null && !secret) rows.push(`Default: ${defaultValue}`);
         ui.panel("Input Required", rows.join("\n"), ui.YELLOW);
-        return await ui.prompt("Enter value: ", secret);
+        const answer = await ui.prompt("Enter value: ", secret);
+        if (answer === null) throw new Error("user cancelled input");
+        return answer;
       }
     });
 
@@ -157,7 +159,12 @@ export class AgentServer {
       return true;
     }
     while (true) {
-      const answer = (await this.ui.transientPrompt(`Allow Mate to run \`${summary}\`? [y/N] `)).trim().toLowerCase();
+      const rawAnswer = await this.ui.transientPrompt(`Allow Mate to run \`${summary}\`? [y/N] `);
+      if (rawAnswer === null) {
+        this.ui.warning(`Cancelled approval for \`${summary}\``);
+        return false;
+      }
+      const answer = rawAnswer.trim().toLowerCase();
       if (["y", "yes"].includes(answer)) {
         this.ui.success(`You approved Mate to run \`${summary}\` this time`);
         return true;

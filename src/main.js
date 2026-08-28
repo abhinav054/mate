@@ -109,7 +109,12 @@ async function main() {
   }
 
   while (true) {
-    let userInput = (await UI.prompt(UI.promptLabel())).trim();
+    const promptAnswer = await UI.prompt(UI.promptLabel());
+    if (promptAnswer === null) {
+      UI.success("Closed Mate.");
+      break;
+    }
+    let userInput = promptAnswer.trim();
     if (["exit", "quit"].includes(userInput.toLowerCase())) break;
     if (!userInput) continue;
     if (await handleRuntimeCommand(server, userInput)) continue;

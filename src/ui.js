@@ -88,6 +88,12 @@ export class TerminalUI {
     const rl = readline.createInterface({ input, output });
     try {
       return await rl.question(this.style(label, this.BOLD, this.YELLOW));
+    } catch (error) {
+      if (error && error.code === "ABORT_ERR") {
+        output.write("\n");
+        return null;
+      }
+      throw error;
     } finally {
       rl.close();
     }
@@ -144,7 +150,10 @@ export class TerminalUI {
             output.write("\n");
             resolve(value);
           } else if (char === "\u0003") {
-            process.exit(130);
+            input.off("data", onData);
+            if (input.isTTY) input.setRawMode(Boolean(wasRaw));
+            output.write("\n");
+            resolve(null);
           } else if (char === "\u007f") {
             value = value.slice(0, -1);
           } else {
