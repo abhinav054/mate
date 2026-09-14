@@ -110,6 +110,25 @@ Inside Mate:
 /reset
 ```
 
+Mate saves each conversation in the workspace-local `.mate/sessions` directory.
+Each session contains `messages.jsonl` for resuming and `transcript.txt` for
+plain-text reading.
+
+List saved sessions for the current workspace:
+
+```bash
+mate session
+```
+
+Resume the latest saved conversation:
+
+```bash
+mate resume
+```
+
+Pass `--workspace /path/to/workspace` to list or resume sessions somewhere other
+than the current directory.
+
 ## Configuration
 
 Mate loads configuration from `~/.mate` by default, or from another directory

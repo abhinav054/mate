@@ -218,8 +218,6 @@ This plugin is included in the Mate repository. The commands are automatically a
 
 ## Author
 
-Anthropic (support@anthropic.com)
-
 ## Version
 
 1.0.0

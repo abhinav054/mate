@@ -4,6 +4,7 @@ import path from "node:path";
 import * as config from "./config.js";
 import { version } from "./version.js";
 import * as tools from "./tools.js";
+import * as sessions from "./sessions.js";
 
 function preview(value, limit = 900) {
   const text = String(value || "").trim();
@@ -71,15 +72,17 @@ export function approvalCommandSummary(name, args) {
 }
 
 export class AgentServer {
-  constructor({ client, model, ui, messages, mateConfig }) {
+  constructor({ client, model, ui, messages, mateConfig, session }) {
     this.client = client;
     this.model = model;
     this.ui = ui;
     this.messages = messages;
     this.config = mateConfig;
+    this.session = session;
+    this.savedMessageCount = messages.length;
   }
 
-  static create(workspace, ui) {
+  static create(workspace, ui, options = {}) {
     const workspacePath = tools.setWorkspace(workspace);
     const workspaceMateHome = path.join(workspacePath, ".mate");
     const configHome = process.env.MATE_HOME ? null : (fs.existsSync(workspaceMateHome) ? workspaceMateHome : null);
@@ -113,20 +116,33 @@ export class AgentServer {
     const projectContext = tools.projectStructureSummary();
     const promptMessages = mateConfig.prompt_override ? [{ role: "system", content: mateConfig.prompt_override }] : [];
     const projectMessage = { role: "system", content: `Project structure context captured at startup. Use this to orient yourself before answering the first user request:\n${projectContext}` };
-    ui.banner(`Mate ${version()}`, `Workspace: ${workspacePath}\nConfig: ${mateConfig.mate_home}\nResources: ${resourceRoot}\nBase URL: ${baseURL}\nModel: ${model}\n\nType a request, /help for commands, or exit/quit to close.`);
+    const session = options.session || sessions.createSession(workspacePath);
+    const restoredMessages = Array.isArray(options.resumeMessages) ? options.resumeMessages : [];
+    ui.banner(`Mate ${version()}`, `Workspace: ${workspacePath}\nConfig: ${mateConfig.mate_home}\nResources: ${resourceRoot}\nBase URL: ${baseURL}\nModel: ${model}\nSession: ${session.id}${restoredMessages.length ? " (resumed)" : ""}\n\nType a request, /help for commands, or exit/quit to close.`);
     ui.panel("Project Structure", projectContext, ui.CYAN);
-    return new AgentServer({ client: new OpenAI({ apiKey, baseURL }), model, ui, messages: [baseSystemMessage, ...promptMessages, projectMessage], mateConfig });
+    return new AgentServer({ client: new OpenAI({ apiKey, baseURL }), model, ui, messages: [baseSystemMessage, ...promptMessages, projectMessage, ...restoredMessages], mateConfig, session });
   }
 
   reset(steeringMessage = null) {
     const promptMessages = this.config.prompt_override ? [{ role: "system", content: this.config.prompt_override }] : [];
     const project = { role: "system", content: `Project structure context captured at reset. Use this to orient yourself before answering the next user request:\n${tools.projectStructureSummary()}` };
     this.messages = [this.messages[0], ...promptMessages, project, ...(steeringMessage ? [steeringMessage] : [])];
+    this.savedMessageCount = this.messages.length;
   }
 
   async runTurn(userGoal) {
     this.messages.push({ role: "user", content: userGoal });
-    return await this.runAgentTurn(userGoal);
+    try {
+      return await this.runAgentTurn(userGoal);
+    } finally {
+      this.saveNewMessages();
+    }
+  }
+
+  saveNewMessages() {
+    const newMessages = this.messages.slice(this.savedMessageCount).filter((message) => message.role !== "system");
+    sessions.appendMessages(this.session, newMessages);
+    this.savedMessageCount = this.messages.length;
   }
 
   async toolMessage(toolCall) {

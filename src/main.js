@@ -2,17 +2,18 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { AgentServer } from "./server.js";
 import { TerminalUI as UI } from "./ui.js";
 import * as tools from "./tools.js";
+import * as sessions from "./sessions.js";
 
 const steeringPrompts = [];
 
 function parseArgs(argv) {
-  const args = { workspace_arg: null, workspace_option: null };
+  const args = { command: null, workspace_arg: null, workspace_option: null };
   for (let i = 0; i < argv.length; i++) {
     const item = argv[i];
     if (item === "--workspace") args.workspace_option = argv[++i];
+    else if (!args.command && ["session", "resume"].includes(item)) args.command = item;
     else if (!args.workspace_arg) args.workspace_arg = item;
   }
   return args;
@@ -21,6 +22,7 @@ function parseArgs(argv) {
 function resolveWorkspace(args) {
   const workspace = args.workspace_option || args.workspace_arg;
   if (workspace) return workspace;
+  if (args.command) return process.cwd();
   return fs.mkdtempSync(path.join(os.tmpdir(), "mate-"));
 }
 
@@ -32,7 +34,7 @@ function friendlyError(error) {
 }
 
 function printHelp() {
-  UI.panel("Help", "Commands:\n- /help: show this help\n- /steer <guidance>: add persistent steering for future turns\n- /steer show: show active steering\n- /steer clear: clear active steering\n- /reset: clear conversation history except the base system prompt and steering\n- /resources [kind]: list copied resources; kind can be all, agents, skills, commands, hooks, plugins\n- /backgrounds: list background processes started in this session\n- /<command> [args]: run a copied slash command, for example /commit or /feature-dev auth flow\n- exit or quit: close Mate\n\nShell commands and mutating Git commands require approval before they run.\n");
+  UI.panel("Help", "Commands:\n- /help: show this help\n- /steer <guidance>: add persistent steering for future turns\n- /steer show: show active steering\n- /steer clear: clear active steering\n- /reset: clear conversation history except the base system prompt and steering\n- /resources [kind]: list copied resources; kind can be all, agents, skills, commands, hooks, plugins\n- /backgrounds: list background processes started in this session\n- /<command> [args]: run a copied slash command, for example /commit or /feature-dev auth flow\n- exit or quit: close Mate\n\nCLI commands:\n- mate session [--workspace path]: show saved sessions in workspace/.mate/sessions\n- mate resume [--workspace path]: resume the latest saved conversation\n\nShell commands and mutating Git commands require approval before they run.\n");
 }
 
 function steeringMessage() {
@@ -99,10 +101,23 @@ function expandSlashCommand(userInput) {
 }
 
 async function main() {
-  const workspace = resolveWorkspace(parseArgs(process.argv.slice(2)));
+  const args = parseArgs(process.argv.slice(2));
+  const workspace = path.resolve(resolveWorkspace(args));
+  if (args.command === "session") {
+    UI.panel("Sessions", sessions.formatSessionList(workspace), UI.CYAN);
+    return;
+  }
+
+  const resumeSession = args.command === "resume" ? sessions.latestSession(workspace) : null;
+  if (args.command === "resume" && !resumeSession) {
+    UI.panel("Resume", `No saved sessions in ${path.join(workspace, ".mate", "sessions")}.`, UI.YELLOW);
+    return;
+  }
+
   let server;
   try {
-    server = AgentServer.create(workspace, UI);
+    const { AgentServer } = await import("./server.js");
+    server = AgentServer.create(workspace, UI, resumeSession ? { session: resumeSession, resumeMessages: sessions.readSessionMessages(resumeSession) } : {});
   } catch (error) {
     UI.panel("Error", friendlyError(error), UI.RED);
     return;
