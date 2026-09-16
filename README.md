@@ -74,6 +74,12 @@ or `MATE_KEYS_FILE` to read another file.
 Environment fallback names are `OPENAI_API_KEY`, `OPENAI_BASE_URL`, and
 `OPENAI_MODEL`.
 
+Mate automatically compacts long conversations before model requests when the
+estimated context exceeds `AGENT_CONTEXT_MAX_TOKENS` (default `90000`). The
+compactor summarizes older messages into durable working memory while preserving
+the most recent messages verbatim. Tune it with `AGENT_CONTEXT_TARGET_TOKENS`
+and `AGENT_CONTEXT_KEEP_RECENT_MESSAGES`.
+
 ## Run
 
 Use a specific workspace:

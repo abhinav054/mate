@@ -18,6 +18,48 @@ function jsonArguments(value) {
   return parsed;
 }
 
+function estimateTokens(messages) {
+  const text = messages.map((message) => {
+    const pieces = [message.role, message.content];
+    if (message.tool_calls) pieces.push(JSON.stringify(message.tool_calls));
+    if (message.name) pieces.push(message.name);
+    if (message.tool_call_id) pieces.push(message.tool_call_id);
+    return pieces.filter(Boolean).join("\n");
+  }).join("\n\n");
+  return Math.ceil(text.length / 4);
+}
+
+function splitContextForCompaction(messages, keepRecentMessages) {
+  const systemMessages = messages.filter((message) => message.role === "system");
+  const nonSystem = messages.filter((message) => message.role !== "system");
+  if (nonSystem.length <= keepRecentMessages) return { systemMessages, compactable: [], recent: nonSystem };
+
+  let recentStart = Math.max(0, nonSystem.length - keepRecentMessages);
+  while (recentStart > 0 && nonSystem[recentStart].role === "tool") recentStart--;
+  const previous = recentStart > 0 ? nonSystem[recentStart - 1] : null;
+  if (previous && previous.tool_calls && previous.tool_calls.length) recentStart--;
+
+  return {
+    systemMessages,
+    compactable: nonSystem.slice(0, recentStart),
+    recent: nonSystem.slice(recentStart)
+  };
+}
+
+function messageForSummary(message) {
+  const label = String(message.role || "message").toUpperCase();
+  const body = messageTextForContext(message);
+  if (message.role === "tool") return `[TOOL ${message.tool_call_id || ""}]\n${body}`;
+  if (message.tool_calls && message.tool_calls.length) return `[${label}]\n${body}\nTool calls: ${JSON.stringify(message.tool_calls)}`;
+  return `[${label}]\n${body}`;
+}
+
+function messageTextForContext(message) {
+  if (typeof message.content === "string") return message.content;
+  if (Array.isArray(message.content)) return message.content.map((part) => part.text || JSON.stringify(part)).join("\n");
+  return message.content == null ? "" : JSON.stringify(message.content);
+}
+
 export function describeToolStart(name, args) {
   const path = args.path;
   const cwd = args.cwd || ".";
@@ -194,6 +236,7 @@ export class AgentServer {
 
   async runAgentUntilAnswer() {
     while (true) {
+      await this.compactContextIfNeeded();
       const response = await this.createChatCompletionWithRetry({ label: "model request", model: this.model, messages: this.messages, tools: tools.TOOL_DEFINITIONS, tool_choice: "auto" });
       const message = response.choices[0].message;
       this.messages.push(message);
@@ -219,6 +262,56 @@ export class AgentServer {
       }
     }
     return "";
+  }
+
+  async compactContextIfNeeded() {
+    const maxTokens = Math.max(1000, Number.parseInt(process.env.AGENT_CONTEXT_MAX_TOKENS || "90000", 10));
+    const targetTokens = Math.max(1000, Number.parseInt(process.env.AGENT_CONTEXT_TARGET_TOKENS || String(Math.floor(maxTokens * 0.65)), 10));
+    const keepRecentMessages = Math.max(8, Number.parseInt(process.env.AGENT_CONTEXT_KEEP_RECENT_MESSAGES || "24", 10));
+    const currentTokens = estimateTokens(this.messages);
+    if (currentTokens <= maxTokens) return;
+
+    const { systemMessages, compactable, recent } = splitContextForCompaction(this.messages, keepRecentMessages);
+    if (!compactable.length) return;
+
+    this.saveNewMessages();
+    this.ui.panel("Compacting Context", `Estimated context is ${currentTokens} tokens. Summarizing older turns and preserving recent work verbatim.`, this.ui.YELLOW);
+    this.ui.activity("Compacting context", `estimated ${currentTokens} tokens; preserving recent work verbatim`, this.ui.YELLOW);
+    const existingSummary = systemMessages.find((message) => message.name === "context_compaction_summary");
+    const summaryInput = [
+      existingSummary ? `Previous compacted context:\n${existingSummary.content}` : "",
+      "Older conversation to compact:",
+      compactable.map(messageForSummary).join("\n\n")
+    ].filter(Boolean).join("\n\n");
+
+    const response = await this.createChatCompletionWithRetry({
+      label: "context compaction",
+      model: this.model,
+      messages: [
+        {
+          role: "system",
+          content: "You compact an agent conversation so work can continue with minimal context loss. Keep durable facts, user goals, constraints, decisions, files changed or inspected, commands run, test results, tool outputs that matter, unresolved tasks, and any active assumptions. Omit chatter, duplicate output, and irrelevant logs. Write concise bullet points."
+        },
+        { role: "user", content: summaryInput }
+      ]
+    });
+
+    const summary = response.choices[0].message.content || "Context was compacted, but the summarizer returned no details.";
+    const summaryMessage = {
+      role: "system",
+      name: "context_compaction_summary",
+      content: `Compacted conversation context. Use this as durable memory for prior turns while treating newer messages as authoritative:\n${summary}`
+    };
+    const preservedSystemMessages = systemMessages.filter((message) => message.name !== "context_compaction_summary");
+    this.messages = [...preservedSystemMessages, summaryMessage, ...recent];
+    this.savedMessageCount = this.messages.length;
+
+    const compactedTokens = estimateTokens(this.messages);
+    if (compactedTokens > targetTokens && recent.length > 12) {
+      this.ui.activity("Compacted context", `now estimated ${compactedTokens} tokens; still above target because recent messages were preserved`, this.ui.YELLOW);
+    } else {
+      this.ui.activity("Compacted context", `now estimated ${compactedTokens} tokens`, this.ui.GREEN);
+    }
   }
 
   async assessAnswer(userGoal, answer) {
