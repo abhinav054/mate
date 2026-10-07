@@ -1,6 +1,4 @@
 #!/usr/bin/env node
-import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { TerminalUI as UI } from "./ui.js";
 import * as tools from "./tools.js";
@@ -9,10 +7,16 @@ import * as sessions from "./sessions.js";
 const steeringPrompts = [];
 
 function parseArgs(argv) {
-  const args = { command: null, workspace_arg: null, workspace_option: null };
+  const args = { command: null, workspace_arg: null, workspace_option: null, stdio: false };
   for (let i = 0; i < argv.length; i++) {
     const item = argv[i];
-    if (item === "--workspace") args.workspace_option = argv[++i];
+    if (["--stdio", "--server", "app-server"].includes(item)) args.stdio = true;
+    else if (item === "--workspace") {
+      if (!argv[i + 1] || argv[i + 1].startsWith("-")) throw new Error("--workspace requires a path");
+      args.workspace_option = argv[++i];
+    } else if (item === "--ui") {
+      if (argv[++i] !== "terminal") throw new Error("--ui requires terminal");
+    } else if (item.startsWith("-")) throw new Error(`Unknown option: ${item}`);
     else if (!args.command && ["session", "resume"].includes(item)) args.command = item;
     else if (!args.workspace_arg) args.workspace_arg = item;
   }
@@ -22,8 +26,7 @@ function parseArgs(argv) {
 function resolveWorkspace(args) {
   const workspace = args.workspace_option || args.workspace_arg;
   if (workspace) return workspace;
-  if (args.command) return process.cwd();
-  return fs.mkdtempSync(path.join(os.tmpdir(), "mate-"));
+  return process.cwd();
 }
 
 function friendlyError(error) {
@@ -103,6 +106,11 @@ function expandSlashCommand(userInput) {
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const workspace = path.resolve(resolveWorkspace(args));
+  if (args.stdio) {
+    const { runStdioServer } = await import("./stdio.js");
+    await runStdioServer({ workspace });
+    return;
+  }
   if (args.command === "session") {
     UI.panel("Sessions", sessions.formatSessionList(workspace), UI.CYAN);
     return;
@@ -117,12 +125,14 @@ async function main() {
   let server;
   try {
     const { AgentServer } = await import("./server.js");
-    server = AgentServer.create(workspace, UI, resumeSession ? { session: resumeSession, resumeMessages: sessions.readSessionMessages(resumeSession) } : {});
+    server = await AgentServer.create(workspace, UI, resumeSession ? { session: resumeSession, resumeMessages: sessions.readSessionMessages(resumeSession) } : {});
   } catch (error) {
     UI.panel("Error", friendlyError(error), UI.RED);
+    process.exitCode = 1;
     return;
   }
 
+  try {
   while (true) {
     const promptAnswer = await UI.prompt(UI.promptLabel());
     if (promptAnswer === null) {
@@ -144,6 +154,14 @@ async function main() {
       UI.panel("Error", friendlyError(error), UI.RED);
     }
   }
+  } finally {
+    if (server.mcpRegistry?.clients) {
+      await Promise.allSettled([...server.mcpRegistry.clients.values()].map(({ client }) => client.close()));
+    }
+  }
 }
 
-main();
+main().catch((error) => {
+  process.stderr.write(`${error.message}\n`);
+  process.exitCode = 1;
+});

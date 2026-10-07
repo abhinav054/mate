@@ -1,5 +1,52 @@
 import readline from "node:readline/promises";
-import { stdin as input, stdout as output } from "node:process";
+import { stdin as input, stdout as output, stderr } from "node:process";
+
+function jsonRpcSink() {
+  const mode = String(process.env.MATE_EVENT_STREAM || "").toLowerCase();
+  if (!["jsonrpc", "codex-app"].includes(mode)) return null;
+  return process.env.MATE_EVENT_STREAM_FD === "2" ? stderr : output;
+}
+
+class ActivityView {
+  static render(ui, activity) {
+    const marker = ui.style(this.marker, this.color(ui), ui.BOLD);
+    const suffix = activity.detail ? ` ${ui.highlight(activity.detail)}` : "";
+    console.log(`${marker} ${ui.style(activity.title, ui.BOLD, this.color(ui))}${suffix}`);
+  }
+}
+
+class PlanActivity extends ActivityView {
+  static marker = "#";
+  static color(ui) { return ui.CYAN; }
+}
+
+class ReasoningActivity extends ActivityView {
+  static marker = "?";
+  static color(ui) { return ui.YELLOW; }
+}
+
+class CommandActivity extends ActivityView {
+  static marker = "$";
+  static color(ui) { return ui.MAGENTA; }
+}
+
+class FileChangeActivity extends ActivityView {
+  static marker = "+";
+  static color(ui) { return ui.GREEN; }
+}
+
+class ToolActivity extends ActivityView {
+  static marker = "*";
+  static color(ui) { return ui.MAGENTA; }
+}
+
+export const activityViews = {
+  plan: PlanActivity,
+  reasoning: ReasoningActivity,
+  command: CommandActivity,
+  files: FileChangeActivity,
+  tool: ToolActivity
+};
 
 export class TerminalUI {
   static BLACK = "\x1b[30m";
@@ -50,16 +97,32 @@ export class TerminalUI {
 
   static answer(body, elapsedSeconds = null) {
     const title = elapsedSeconds === null ? "Result" : `Worked for ${this.formatDuration(elapsedSeconds)}`;
+    this.emitEvent("assistant.message", { markdown: String(body || ""), elapsed_seconds: elapsedSeconds });
     this.rule(this.style(title, this.BOLD, this.GREEN));
     this.body(body);
     this.rule();
     console.log();
   }
 
-  static activity(action, detail = "", color = this.CYAN) {
-    const marker = this.style("*", color, this.BOLD);
-    const suffix = detail ? ` ${this.highlight(detail)}` : "";
-    console.log(`${marker} ${this.style(action, this.BOLD, color)}${suffix}`);
+  static activity(action, detail = "", color = this.CYAN, type = "tool") {
+    const activity = { type: activityViews[type] ? type : "tool", title: action, detail, color };
+    this.emitActivity(activity);
+    const View = activityViews[activity.type] || ToolActivity;
+    View.render(this, activity);
+  }
+
+  static emitActivity(activity) {
+    this.emitEvent("activity", {
+      type: activity.type,
+      title: String(activity.title || ""),
+      detail: String(activity.detail || "")
+    });
+  }
+
+  static emitEvent(method, params = {}) {
+    const sink = jsonRpcSink();
+    if (!sink) return;
+    sink.write(JSON.stringify({ jsonrpc: "2.0", method: `codex.${method}`, params }) + "\n");
   }
 
   static success(body) {
@@ -71,6 +134,7 @@ export class TerminalUI {
   }
 
   static diff(body) {
+    this.emitEvent("activity", { type: "files", title: "File Diff", detail: "workspace files changed" });
     this.rule(this.style("File Diff", this.BOLD, this.MAGENTA));
     for (const line of body.split(/\r?\n/)) {
       if (line.startsWith("+") && !line.startsWith("+++")) console.log(this.style(line, this.GREEN));
@@ -114,6 +178,10 @@ export class TerminalUI {
       return;
     }
     for (const line of String(body).replace(/\s+$/, "").split(/\r?\n/)) console.log(this.highlight(line));
+  }
+
+  static userMessage(body = "") {
+    this.emitEvent("user.message", { markdown: String(body || "") });
   }
 
   static highlight(value) {

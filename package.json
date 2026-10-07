@@ -15,10 +15,12 @@
   },
   "scripts": {
     "start": "node src/main.js",
+    "server": "node src/main.js --stdio",
     "check": "npm run smoke",
-    "smoke": "node --check src/main.js && node --check src/server.js && node --check src/sessions.js && node --check src/tools.js && node --check src/config.js && node --check src/ui.js"
+    "smoke": "node --check src/main.js && node --check src/server.js && node --check src/sessions.js && node --check src/tools.js && node --check src/config.js && node --check src/mcp.js && node --check src/ui.js"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "openai": "^4.104.0"
   },
   "engines": {

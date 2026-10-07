@@ -5,6 +5,7 @@ import * as config from "./config.js";
 import { version } from "./version.js";
 import * as tools from "./tools.js";
 import * as sessions from "./sessions.js";
+import { McpRegistry, loadMcpServers } from "./mcp.js";
 
 function preview(value, limit = 900) {
   const text = String(value || "").trim();
@@ -114,17 +115,19 @@ export function approvalCommandSummary(name, args) {
 }
 
 export class AgentServer {
-  constructor({ client, model, ui, messages, mateConfig, session }) {
+  
+  constructor({ client, model, ui, messages, mateConfig, session, mcpRegistry = null }) {
     this.client = client;
     this.model = model;
     this.ui = ui;
     this.messages = messages;
     this.config = mateConfig;
     this.session = session;
+    this.mcpRegistry = mcpRegistry;
     this.savedMessageCount = messages.length;
   }
 
-  static create(workspace, ui, options = {}) {
+  static async create(workspace, ui, options = {}) {
     const workspacePath = tools.setWorkspace(workspace);
     const workspaceMateHome = path.join(workspacePath, ".mate");
     const configHome = process.env.MATE_HOME ? null : (fs.existsSync(workspaceMateHome) ? workspaceMateHome : null);
@@ -153,16 +156,20 @@ export class AgentServer {
     const resourceRoot = tools.resourceRoot();
     const baseSystemMessage = {
       role: "system",
-      content: `You are Mate, a coding companion running in a terminal. Your workspace is ${workspacePath}. Mate config is loaded from ${mateConfig.mate_home}. Agent resources are available at ${resourceRoot}. Use tools to inspect, search, create, and edit files. Do not write outside the workspace. At the start of every session, first understand the project structure from the supplied project structure context and inspect any additional files needed before planning changes. When browsing, use the browse_internet tool. Use list_agent_resources and read_agent_resource to discover and apply copied agents, skills, commands, hooks, and plugin guidance when relevant. Tool name mappings: LS=list_files, Glob=glob_files, Grep=search_files, Read=read_file, Write=write_file, Edit/MultiEdit=edit_file, Bash=run_command, TodoWrite=update_todos, Skill=load_skill, Task=load_agent_prompt, and slash commands=load_command. Use the git tool for Git status, diff, log, branch, show, add, commit, restore, and related operations instead of run_command. Use run_command for tests, formatting, and project inspection. After writing code, summarize the changed files and the verification you performed.`
+      content: `You are Mate, a coding companion running in a terminal and compatible with the Codex app server activity model. Your workspace is ${workspacePath}. Mate config is loaded from ${mateConfig.mate_home}. Agent resources are available at ${resourceRoot}. Use tools to inspect, search, create, and edit files. Do not write outside the workspace. At the start of every session, first understand the project structure from the supplied project structure context and inspect any additional files needed before planning changes. Write user-facing responses as GitHub-flavored Markdown, not plain text. Keep final answers concise, with changed files and verification when code was modified. Mate emits Codex app server JSON-RPC notifications for activity and message events; shape your work so events map cleanly to plan, reasoning, command, files, and tool activity types. When browsing, use the browse_internet tool. Use list_agent_resources and read_agent_resource to discover and apply copied agents, skills, commands, hooks, and plugin guidance when relevant. Tool name mappings: LS=list_files, Glob=glob_files, Grep=search_files, Read=read_file, Write=write_file, Edit/MultiEdit=edit_file, Bash=run_command, TodoWrite=update_todos, Skill=load_skill, Task=load_agent_prompt, and slash commands=load_command. Use the git tool for Git status, diff, log, branch, show, add, commit, restore, and related operations instead of run_command. Use run_command for tests, formatting, and project inspection. After writing code, summarize the changed files and the verification you performed.`
     };
     const projectContext = tools.projectStructureSummary();
     const promptMessages = mateConfig.prompt_override ? [{ role: "system", content: mateConfig.prompt_override }] : [];
     const projectMessage = { role: "system", content: `Project structure context captured at startup. Use this to orient yourself before answering the first user request:\n${projectContext}` };
     const session = options.session || sessions.createSession(workspacePath);
     const restoredMessages = Array.isArray(options.resumeMessages) ? options.resumeMessages : [];
-    ui.banner(`Mate ${version()}`, `Workspace: ${workspacePath}\nConfig: ${mateConfig.mate_home}\nResources: ${resourceRoot}\nBase URL: ${baseURL}\nModel: ${model}\nSession: ${session.id}${restoredMessages.length ? " (resumed)" : ""}\n\nType a request, /help for commands, or exit/quit to close.`);
-    ui.panel("Project Structure", projectContext, ui.CYAN);
-    return new AgentServer({ client: new OpenAI({ apiKey, baseURL }), model, ui, messages: [baseSystemMessage, ...promptMessages, projectMessage, ...restoredMessages], mateConfig, session });
+    const mcpRegistry = new McpRegistry({ servers: loadMcpServers(mateConfig.raw), mateHome: mateConfig.mate_home, workspace: workspacePath, ui });
+    await mcpRegistry.connectAll();
+    if (options.showStartup !== false) {
+      ui.banner(`Mate ${version()}`, `Workspace: ${workspacePath}\nConfig: ${mateConfig.mate_home}\nResources: ${resourceRoot}\nBase URL: ${baseURL}\nModel: ${model}\nSession: ${session.id}${restoredMessages.length ? " (resumed)" : ""}\nMCP tools: ${mcpRegistry.toolDefinitions.length}\n\nType a request, /help for commands, or exit/quit to close.`);
+      ui.panel("Project Structure", projectContext, ui.CYAN);
+    }
+    return new AgentServer({ client: new OpenAI({ apiKey, baseURL }), model, ui, messages: [baseSystemMessage, ...promptMessages, projectMessage, ...restoredMessages], mateConfig, session, mcpRegistry });
   }
 
   reset(steeringMessage = null) {
@@ -194,19 +201,22 @@ export class AgentServer {
     let args = {};
     try {
       args = jsonArguments(toolCall.function.arguments);
-      this.ui.activity("Working", describeToolStart(name, args), this.ui.MAGENTA);
+      this.ui.activity("Working", describeToolStart(name, args), this.ui.MAGENTA, activityTypeForTool(name));
       const command = String(args.command || "");
       let requiresApproval = config.toolRequiresApproval(this.config, name, command);
       if (name === "git" && tools.gitRequiresApproval(command)) requiresApproval = !config.toolAllowedWithoutApproval(this.config, name, `git ${command}`);
       if (requiresApproval && !(await this.confirmToolExecution(name, args))) throw new Error("user denied command approval");
-      const fn = tools.TOOLS[name];
-      if (!fn) throw new Error(`unknown tool: ${name}`);
-      result = await fn(args);
+      if (this.mcpRegistry && this.mcpRegistry.hasTool(name)) result = await this.mcpRegistry.callTool(name, args);
+      else {
+        const fn = tools.TOOLS[name];
+        if (!fn) throw new Error(`unknown tool: ${name}`);
+        result = await fn(args);
+      }
     } catch (error) {
       failed = true;
       result = `ERROR: ${error.name}: ${error.message}`;
     }
-    this.ui.activity(failed ? `Failed ${toolActionName(name).toLowerCase()}` : toolActionName(name), describeToolDone(name, result, failed), failed ? this.ui.RED : this.ui.GREEN);
+    this.ui.activity(failed ? `Failed ${toolActionName(name).toLowerCase()}` : toolActionName(name), describeToolDone(name, result, failed), failed ? this.ui.RED : this.ui.GREEN, activityTypeForTool(name));
     return { role: "tool", tool_call_id: toolCall.id, content: String(result) };
   }
 
@@ -237,7 +247,7 @@ export class AgentServer {
   async runAgentUntilAnswer() {
     while (true) {
       await this.compactContextIfNeeded();
-      const response = await this.createChatCompletionWithRetry({ label: "model request", model: this.model, messages: this.messages, tools: tools.TOOL_DEFINITIONS, tool_choice: "auto" });
+      const response = await this.createChatCompletionWithRetry({ label: "model request", model: this.model, messages: this.messages, tools: [...tools.TOOL_DEFINITIONS, ...((this.mcpRegistry && this.mcpRegistry.toolDefinitions) || [])], tool_choice: "auto" });
       const message = response.choices[0].message;
       this.messages.push(message);
       if (!message.tool_calls || !message.tool_calls.length) return message.content || "";
@@ -254,10 +264,10 @@ export class AgentServer {
         const assessment = await this.assessAnswer(userGoal, answer);
         if (assessment.aligned) return answer;
         if (!assessment.can_improve_with_tools || !assessment.follow_up_prompt) return answer;
-        this.ui.activity("Worked on result", `taking another pass. ${assessment.reason || ""}`.trim(), this.ui.YELLOW);
+        this.ui.activity("Worked on result", `taking another pass. ${assessment.reason || ""}`.trim(), this.ui.YELLOW, "reasoning");
         this.messages.push({ role: "user", content: `Result check feedback: your previous answer may not fully satisfy the user. Use any relevant tools and improve the answer. Reason: ${assessment.reason || ""}\nFollow-up instruction: ${assessment.follow_up_prompt}` });
       } catch (error) {
-        this.ui.activity("Worked on result", `check skipped (${error.name}: ${error.message})`, this.ui.YELLOW);
+        this.ui.activity("Worked on result", `check skipped (${error.name}: ${error.message})`, this.ui.YELLOW, "reasoning");
         return answer;
       }
     }
@@ -276,7 +286,7 @@ export class AgentServer {
 
     this.saveNewMessages();
     this.ui.panel("Compacting Context", `Estimated context is ${currentTokens} tokens. Summarizing older turns and preserving recent work verbatim.`, this.ui.YELLOW);
-    this.ui.activity("Compacting context", `estimated ${currentTokens} tokens; preserving recent work verbatim`, this.ui.YELLOW);
+    this.ui.activity("Compacting context", `estimated ${currentTokens} tokens; preserving recent work verbatim`, this.ui.YELLOW, "reasoning");
     const existingSummary = systemMessages.find((message) => message.name === "context_compaction_summary");
     const summaryInput = [
       existingSummary ? `Previous compacted context:\n${existingSummary.content}` : "",
@@ -308,9 +318,9 @@ export class AgentServer {
 
     const compactedTokens = estimateTokens(this.messages);
     if (compactedTokens > targetTokens && recent.length > 12) {
-      this.ui.activity("Compacted context", `now estimated ${compactedTokens} tokens; still above target because recent messages were preserved`, this.ui.YELLOW);
+      this.ui.activity("Compacted context", `now estimated ${compactedTokens} tokens; still above target because recent messages were preserved`, this.ui.YELLOW, "reasoning");
     } else {
-      this.ui.activity("Compacted context", `now estimated ${compactedTokens} tokens`, this.ui.GREEN);
+      this.ui.activity("Compacted context", `now estimated ${compactedTokens} tokens`, this.ui.GREEN, "reasoning");
     }
   }
 
@@ -335,7 +345,7 @@ export class AgentServer {
       } catch (error) {
         if (error.status !== 429 || attempt >= maxRetries) throw error;
         const delay = Math.min(2 ** attempt, Number.parseFloat(process.env.AGENT_MODEL_RATE_LIMIT_MAX_DELAY_SECONDS || "30"));
-        this.ui.activity("Rate limited", `${label}; retrying in ${this.ui.formatDuration(delay)}`, this.ui.YELLOW);
+        this.ui.activity("Rate limited", `${label}; retrying in ${this.ui.formatDuration(delay)}`, this.ui.YELLOW, "reasoning");
         await new Promise((resolve) => setTimeout(resolve, delay * 1000));
       }
     }
@@ -350,4 +360,11 @@ function extractJsonObject(value) {
   const end = text.lastIndexOf("}");
   if (start === -1 || end < start) throw new Error("no JSON object found");
   return JSON.parse(text.slice(start, end + 1));
+}
+
+function activityTypeForTool(name) {
+  if (["run_command", "git", "start_background_process", "read_background_process", "write_background_process", "stop_background_process", "list_background_processes"].includes(name)) return "command";
+  if (["write_file", "edit_file", "touch_file"].includes(name)) return "files";
+  if (name === "update_todos") return "plan";
+  return "tool";
 }

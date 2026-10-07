@@ -1,5 +1,22 @@
 # Mate
 
+Mate opens the terminal UI by default. Launch `mate --workspace /path/to/project`
+(or `npm start`). `--ui terminal` is also accepted. The default workspace is the current directory.
+For server mode, use `mate --stdio --workspace /path/to/project` (or `npm run server`).
+Communication uses newline-delimited JSON-RPC 2.0 on stdin/stdout; diagnostics go
+to stderr. In server mode, no terminal UI or interactive prompts are started.
+
+Client requests: `initialize`, `turn/start` with `{ "prompt": "..." }` (or an
+`input` array of `{ "type": "text", "text": "..." }`), `conversation/reset`,
+and `shutdown` when no turn is active. Each request carries an `id` and receives
+a response with that same ID. Only one turn runs at a time.
+
+Activity and Markdown messages retain the `codex.activity`, `codex.user.message`,
+and `codex.assistant.message` notifications. Approvals arrive as server requests
+named `mate/approval/request`; reply with `result: { "approved": true }` or false.
+Input requests use `mate/input/request`; reply with `result: { "value": "..." }`.
+These are Mate's methods, not a complete implementation of the Codex app-server protocol.
+
 Mate is a terminal coding companion for local projects. It talks to an
 OpenAI-compatible API, works inside a bounded workspace, and shows a friendly TUI
 with concise activity updates, approval prompts, colored diffs, and elapsed-time
@@ -96,6 +113,27 @@ mate --workspace /path/to/workspace
 
 If you omit the workspace, Mate creates a fresh temporary workspace under `/tmp`.
 
+Mate uses the terminal UI by default:
+
+```bash
+mate --ui terminal --workspace /path/to/workspace
+```
+
+The former separate chat UI has been removed. The terminal UI now renders typed
+activity views for plan, reasoning, command, file-change, and tool events.
+
+To emit Codex app server-compatible JSON-RPC notifications alongside terminal
+output, set:
+
+```bash
+MATE_EVENT_STREAM=jsonrpc mate --workspace /path/to/workspace
+```
+
+Notifications use `codex.activity`, `codex.user.message`, and
+`codex.assistant.message` methods with JSON-RPC 2.0 notification envelopes.
+Set `MATE_EVENT_STREAM_FD=2` to write those notifications to stderr instead of
+stdout.
+
 For local development, the bundled wrapper sets repo-local config paths:
 
 ```bash
@@ -189,29 +227,61 @@ should usually remain approval-gated.
 
 ## MCP Servers
 
-Put MCP server definitions in `.mate/mcp_servers.toml`. The file is currently the
-canonical config location for Mate integrations and is shaped so a launcher can
-start servers later without mixing connection details into prompts.
+Put MCP server definitions in `.mate/config.toml` or `.mate/mcp_servers.toml` as
+`[servers.<name>]` sections. Mate connects enabled servers at startup, lists
+their tools, and exposes them to the model as `mcp__<server>__<tool>` function
+tools.
 
 Example stdio server:
 
 ```toml
 [servers.filesystem]
+transport = "stdio"
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/workspace"]
 env = { LOG_LEVEL = "info" }
 ```
 
-Example remote HTTP server:
+Example remote Streamable HTTP server:
 
 ```toml
 [servers.search]
+transport = "http"
 url = "https://mcp.example.com"
 headers = { Authorization = "Bearer ${SEARCH_MCP_TOKEN}" }
 ```
 
+Example legacy server-sent events server:
+
+```toml
+[servers.legacy_search]
+transport = "sse"
+url = "https://mcp.example.com/sse"
+headers = { Authorization = "Bearer ${SEARCH_MCP_TOKEN}" }
+```
+
+Example in-process server using the SDK's in-memory transport:
+
+```toml
+[servers.local_tools]
+transport = "inMemory"
+module = "./local-mcp-server.js"
+export = "createServer"
+```
+
+The factory module can import `InMemoryTransport` directly:
+
+```js
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+
+export async function createServer() {
+  // Return an MCP Server instance, a client transport, or
+  // [clientTransport, serverTransport] from InMemoryTransport.createLinkedPair().
+}
+```
+
 Store tokens in `.mate/keys.env` or your shell environment, not directly in
-`mcp_servers.toml`.
+`config.toml`.
 
 ## Skills
 

@@ -6,6 +6,7 @@ const DEFAULT_CONFIG = "config.toml";
 const DEFAULT_PROMPT = "prompt.md";
 const DEFAULT_KEYS = "keys.env";
 const DEFAULT_DOTENV = ".env";
+const DEFAULT_MCP_SERVERS = "mcp_servers.toml";
 
 function expandHome(value) {
   if (!value) return value;
@@ -23,7 +24,7 @@ export function ensureMateHome(root = mateHome()) {
 
 export function loadConfig(root = null) {
   const mate_home = ensureMateHome(root || mateHome());
-  const raw = loadToml(path.join(mate_home, DEFAULT_CONFIG));
+  const raw = { ...loadToml(path.join(mate_home, DEFAULT_CONFIG)), ...loadToml(path.join(mate_home, DEFAULT_MCP_SERVERS)) };
   loadKeys(path.join(path.dirname(mate_home), DEFAULT_DOTENV));
   loadKeys(path.join(mate_home, DEFAULT_KEYS));
   return {
@@ -104,16 +105,48 @@ function loadToml(filePath) {
     if (value === "[") {
       pendingKey = key;
       pendingItems = [];
-    } else if (["true", "false"].includes(value.toLowerCase())) {
-      section[key] = value.toLowerCase() === "true";
-    } else if (value.startsWith("[") && value.endsWith("]")) {
-      const inner = value.slice(1, -1).trim();
-      section[key] = inner ? inner.split(",").map((item) => unquote(item.trim())) : [];
     } else {
-      section[key] = unquote(value);
+      section[key] = parseTomlValue(value);
     }
   }
   return data;
+}
+
+function parseTomlValue(value) {
+  if (["true", "false"].includes(value.toLowerCase())) return value.toLowerCase() === "true";
+  if (value.startsWith("[") && value.endsWith("]")) {
+    const inner = value.slice(1, -1).trim();
+    return inner ? splitTomlItems(inner).map((item) => unquote(item.trim())) : [];
+  }
+  if (value.startsWith("{") && value.endsWith("}")) {
+    const out = {};
+    for (const item of splitTomlItems(value.slice(1, -1).trim())) {
+      const eq = item.indexOf("=");
+      if (eq === -1) continue;
+      out[item.slice(0, eq).trim()] = parseTomlValue(item.slice(eq + 1).trim());
+    }
+    return out;
+  }
+  return unquote(value);
+}
+
+function splitTomlItems(value) {
+  const items = [];
+  let quote = "";
+  let start = 0;
+  for (let i = 0; i < value.length; i++) {
+    const ch = value[i];
+    if (quote) {
+      if (ch === quote && value[i - 1] !== "\\") quote = "";
+    } else if (ch === "\"" || ch === "'") quote = ch;
+    else if (ch === ",") {
+      items.push(value.slice(start, i).trim());
+      start = i + 1;
+    }
+  }
+  const tail = value.slice(start).trim();
+  if (tail) items.push(tail);
+  return items;
 }
 
 function unquote(value) {
