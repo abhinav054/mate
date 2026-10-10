@@ -7,9 +7,12 @@ Communication uses newline-delimited JSON-RPC 2.0 on stdin/stdout; diagnostics g
 to stderr. In server mode, no terminal UI or interactive prompts are started.
 
 Client requests: `initialize`, `turn/start` with `{ "prompt": "..." }` (or an
-`input` array of `{ "type": "text", "text": "..." }`), `conversation/reset`,
-and `shutdown` when no turn is active. Each request carries an `id` and receives
-a response with that same ID. Only one turn runs at a time.
+`input` array of `{ "type": "text", "text": "..." }`), `turn/interrupt`,
+`conversation/reset`, and `shutdown` when no turn is active. Each request
+carries an `id` and receives a response with that same ID. Only one turn runs at
+a time. `turn/interrupt` is accepted while a turn is active; it aborts the active
+model request, emits `codex.interrupt`, and discards messages produced during the
+interrupted turn from Mate's conversation history.
 
 Activity and Markdown messages retain the `codex.activity`, `codex.user.message`,
 and `codex.assistant.message` notifications. Approvals arrive as server requests
@@ -39,6 +42,20 @@ Or install a published package:
 
 ```bash
 npm install -g mate
+```
+
+Check the installed package version:
+
+```bash
+npm list -g mate --depth=0
+```
+
+Mate currently does not support `--version`, `-v`, or `--help`; these flags
+produce an `Unknown option` error. For help, launch `mate` and enter `/help`.
+For a local checkout, read the package version with:
+
+```bash
+node -p "require('./package.json').version"
 ```
 
 Configure your model in `~/.mate/keys.env`, your shell environment, or a local
@@ -111,7 +128,7 @@ or:
 mate --workspace /path/to/workspace
 ```
 
-If you omit the workspace, Mate creates a fresh temporary workspace under `/tmp`.
+If you omit the workspace, Mate uses the current directory.
 
 Mate uses the terminal UI by default:
 

@@ -1,4 +1,5 @@
 import readline from "node:readline";
+import { TurnInterruptedError } from "./server.js";
 
 export async function runStdioServer({ workspace, input = process.stdin, output = process.stdout, createAgent } = {}) {
   let closed = false;
@@ -9,6 +10,7 @@ export async function runStdioServer({ workspace, input = process.stdin, output 
   let nextId = 0;
   let agent;
   let active = false;
+  let activeTurnRequestId = null;
   const request = (method, params) => new Promise((resolve, reject) => {
     if (closed) { reject(new Error("Client disconnected")); return; }
     const id = `mate-${++nextId}`;
@@ -48,11 +50,19 @@ export async function runStdioServer({ workspace, input = process.stdin, output 
     }
     const respond = (result) => { if (Object.hasOwn(message, "id")) send({ id: message.id, result }); };
     const fail = (code, detail) => { if (Object.hasOwn(message, "id")) send({ id: message.id, error: { code, message: detail } }); };
-    if (message.method === "initialize") { respond({ serverInfo: { name: "mate", version: "0.1.0" }, capabilities: { turns: true, approvals: true, userInput: true }, workspace }); return; }
+    if (message.method === "initialize") { respond({ serverInfo: { name: "mate", version: "0.1.0" }, capabilities: { turns: true, approvals: true, userInput: true, interrupt: true }, workspace }); return; }
     if (message.method === "initialized") return;
     if (message.method === "shutdown") {
       if (active) { fail(-32000, "A turn is running"); return; }
       respond(null); lines.close(); input.pause(); return;
+    }
+    if (message.method === "turn/interrupt") {
+      if (!active || !agent) { fail(-32000, "No turn is running"); return; }
+      const reason = String(message.params?.reason || "client requested interrupt");
+      const interrupted = agent.interruptCurrentTurn(reason);
+      if (interrupted) notify("codex.interrupt", { reason, request_id: activeTurnRequestId });
+      respond({ interrupted });
+      return;
     }
     if (!["turn/start", "conversation/reset"].includes(message.method)) { fail(-32601, "Method not found"); return; }
     if (active) { fail(-32000, "A turn is running"); return; }
@@ -60,6 +70,7 @@ export async function runStdioServer({ workspace, input = process.stdin, output 
     const prompt = params.prompt ?? (Array.isArray(params.input) ? params.input.filter((item) => item.type === "text").map((item) => item.text).join("\n") : undefined);
     if (message.method === "turn/start" && (typeof prompt !== "string" || !prompt.trim())) { fail(-32602, "A nonempty prompt or text input is required"); return; }
     active = true;
+    activeTurnRequestId = Object.hasOwn(message, "id") ? message.id : null;
     try {
       if (!agent) {
         const factory = createAgent || (await import("./server.js")).AgentServer.create;
@@ -71,8 +82,11 @@ export async function runStdioServer({ workspace, input = process.stdin, output 
       const markdown = await agent.runTurn(prompt);
       notify("codex.assistant.message", { markdown, elapsed_seconds: (Date.now() - started) / 1000 });
       respond({ markdown });
-    } catch (error) { fail(-32603, error.message); }
-    finally { active = false; }
+    } catch (error) {
+      if (error instanceof TurnInterruptedError) fail(-32800, error.message);
+      else fail(-32603, error.message);
+    }
+    finally { active = false; activeTurnRequestId = null; }
   }
   lines.on("line", (line) => {
     if (closed) return;

@@ -114,6 +114,13 @@ export function approvalCommandSummary(name, args) {
   return toolActionName(name).toLowerCase();
 }
 
+export class TurnInterruptedError extends Error {
+  constructor(message = "Turn interrupted") {
+    super(message);
+    this.name = "TurnInterruptedError";
+  }
+}
+
 export class AgentServer {
   
   constructor({ client, model, ui, messages, mateConfig, session, mcpRegistry = null }) {
@@ -125,6 +132,7 @@ export class AgentServer {
     this.session = session;
     this.mcpRegistry = mcpRegistry;
     this.savedMessageCount = messages.length;
+    this.currentTurn = null;
   }
 
   static async create(workspace, ui, options = {}) {
@@ -180,12 +188,39 @@ export class AgentServer {
   }
 
   async runTurn(userGoal) {
+    if (this.currentTurn) throw new Error("A turn is already running");
+    const checkpoint = this.messages.length;
+    const controller = new AbortController();
+    this.currentTurn = { controller, interrupted: false, checkpoint };
     this.messages.push({ role: "user", content: userGoal });
     try {
       return await this.runAgentTurn(userGoal);
+    } catch (error) {
+      if (this.isInterruptedError(error)) {
+        this.messages.splice(checkpoint);
+        throw new TurnInterruptedError();
+      }
+      throw error;
     } finally {
-      this.saveNewMessages();
+      if (!this.currentTurn?.interrupted) this.saveNewMessages();
+      this.currentTurn = null;
     }
+  }
+
+  interruptCurrentTurn(reason = "client requested interrupt") {
+    if (!this.currentTurn) return false;
+    this.currentTurn.interrupted = true;
+    this.currentTurn.controller.abort(new TurnInterruptedError(reason));
+    this.ui.activity("Interrupted turn", reason, this.ui.YELLOW, "reasoning");
+    return true;
+  }
+
+  throwIfInterrupted() {
+    if (this.currentTurn?.interrupted) throw new TurnInterruptedError();
+  }
+
+  isInterruptedError(error) {
+    return error instanceof TurnInterruptedError || this.currentTurn?.interrupted || error?.name === "AbortError";
   }
 
   saveNewMessages() {
@@ -195,6 +230,7 @@ export class AgentServer {
   }
 
   async toolMessage(toolCall) {
+    this.throwIfInterrupted();
     const name = toolCall.function.name;
     let failed = false;
     let result = "";
@@ -217,6 +253,7 @@ export class AgentServer {
       result = `ERROR: ${error.name}: ${error.message}`;
     }
     this.ui.activity(failed ? `Failed ${toolActionName(name).toLowerCase()}` : toolActionName(name), describeToolDone(name, result, failed), failed ? this.ui.RED : this.ui.GREEN, activityTypeForTool(name));
+    this.throwIfInterrupted();
     return { role: "tool", tool_call_id: toolCall.id, content: String(result) };
   }
 
@@ -246,19 +283,27 @@ export class AgentServer {
 
   async runAgentUntilAnswer() {
     while (true) {
+      this.throwIfInterrupted();
       await this.compactContextIfNeeded();
+      this.throwIfInterrupted();
       const response = await this.createChatCompletionWithRetry({ label: "model request", model: this.model, messages: this.messages, tools: [...tools.TOOL_DEFINITIONS, ...((this.mcpRegistry && this.mcpRegistry.toolDefinitions) || [])], tool_choice: "auto" });
+      this.throwIfInterrupted();
       const message = response.choices[0].message;
       this.messages.push(message);
       if (!message.tool_calls || !message.tool_calls.length) return message.content || "";
-      for (const toolCall of message.tool_calls) this.messages.push(await this.toolMessage(toolCall));
+      for (const toolCall of message.tool_calls) {
+        this.throwIfInterrupted();
+        this.messages.push(await this.toolMessage(toolCall));
+      }
     }
   }
 
   async runAgentTurn(userGoal) {
     const maxChecks = Math.max(0, Number.parseInt(process.env.AGENT_HARNESS_MAX_RETRIES || "2", 10));
     for (let i = 0; i <= maxChecks; i++) {
+      this.throwIfInterrupted();
       const answer = await this.runAgentUntilAnswer();
+      this.throwIfInterrupted();
       if (i >= maxChecks) return answer;
       try {
         const assessment = await this.assessAnswer(userGoal, answer);
@@ -275,6 +320,7 @@ export class AgentServer {
   }
 
   async compactContextIfNeeded() {
+    this.throwIfInterrupted();
     const maxTokens = Math.max(1000, Number.parseInt(process.env.AGENT_CONTEXT_MAX_TOKENS || "90000", 10));
     const targetTokens = Math.max(1000, Number.parseInt(process.env.AGENT_CONTEXT_TARGET_TOKENS || String(Math.floor(maxTokens * 0.65)), 10));
     const keepRecentMessages = Math.max(8, Number.parseInt(process.env.AGENT_CONTEXT_KEEP_RECENT_MESSAGES || "24", 10));
@@ -306,6 +352,7 @@ export class AgentServer {
       ]
     });
 
+    this.throwIfInterrupted();
     const summary = response.choices[0].message.content || "Context was compacted, but the summarizer returned no details.";
     const summaryMessage = {
       role: "system",
@@ -325,6 +372,7 @@ export class AgentServer {
   }
 
   async assessAnswer(userGoal, answer) {
+    this.throwIfInterrupted();
     const response = await this.createChatCompletionWithRetry({
       label: "result check",
       model: this.model,
@@ -334,6 +382,7 @@ export class AgentServer {
       ],
       response_format: { type: "json_object" }
     });
+    this.throwIfInterrupted();
     return extractJsonObject(response.choices[0].message.content || "{}");
   }
 
@@ -341,8 +390,10 @@ export class AgentServer {
     const maxRetries = Math.max(0, Number.parseInt(process.env.AGENT_MODEL_RATE_LIMIT_RETRIES || "2", 10));
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       try {
-        return await this.client.chat.completions.create(kwargs);
+        this.throwIfInterrupted();
+        return await this.client.chat.completions.create(kwargs, this.currentTurn?.controller ? { signal: this.currentTurn.controller.signal } : undefined);
       } catch (error) {
+        if (this.isInterruptedError(error)) throw new TurnInterruptedError();
         if (error.status !== 429 || attempt >= maxRetries) throw error;
         const delay = Math.min(2 ** attempt, Number.parseFloat(process.env.AGENT_MODEL_RATE_LIMIT_MAX_DELAY_SECONDS || "30"));
         this.ui.activity("Rate limited", `${label}; retrying in ${this.ui.formatDuration(delay)}`, this.ui.YELLOW, "reasoning");
