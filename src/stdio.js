@@ -19,6 +19,7 @@ export async function runStdioServer({ workspace, input = process.stdin, output 
   });
   const ui = {
     banner() {},
+    message: (markdown) => notify("codex.assistant.message", { markdown, phase: "commentary" }),
     panel: (title, detail) => notify("codex.activity", { type: "reasoning", title, detail }),
     activity: (title, detail, color, type = "tool") => notify("codex.activity", { type, title, detail }),
     diff: (detail) => notify("codex.activity", { type: "files", title: "File Diff", detail }),

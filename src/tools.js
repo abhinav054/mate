@@ -213,19 +213,46 @@ export function searchFiles({ query, path: targetPath = "." }) {
   return trimOutput(rows.join("\n")) || "no matches";
 }
 
+export function localSkillSummary() {
+  const root = path.join(mateHome(), "skills");
+  if (!fs.existsSync(root)) return "(no attached skills)";
+  return fs.readdirSync(root, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && fs.existsSync(path.join(root, entry.name, "SKILL.md")))
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .map((entry) => {
+      const file = path.join(root, entry.name, "SKILL.md");
+      const content = fs.readFileSync(file, "utf8");
+      const frontmatter = content.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/)?.[1] || "";
+      const description = frontmatter.match(/^description:[ \t]*(.*)$/m)?.[1]?.trim().replace(/^["']|["']$/g, "") || "";
+      return `- ${entry.name}: ${description} (skills/${entry.name}/SKILL.md; load_skill skill_name="${entry.name}")`;
+    }).join("\n") || "(no attached skills)";
+}
+
 export function listAgentResources({ kind = "all" } = {}) {
   const allowed = new Set(["all", "agents", "skills", "commands", "hooks", "plugins"]);
   if (!allowed.has(kind)) throw new Error(`kind must be one of: ${[...allowed].sort().join(", ")}`);
   const root = resourceRoot();
-  if (!fs.existsSync(root)) return `No resource directory found at ${root}`;
   if (kind === "plugins") {
     const pluginsRoot = path.join(root, "mate-plugins");
     return fs.existsSync(pluginsRoot) ? fs.readdirSync(pluginsRoot, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name).join("\n") || "(empty)" : "No copied plugin directory found.";
   }
-  return (kind === "all" ? ["agents", "skills", "commands", "hooks"] : [kind]).map((item) => `[${item}]\n${fs.existsSync(path.join(root, "index", `${item}.txt`)) ? readTextFile(path.join(root, "index", `${item}.txt`)) : "(missing index)"}`).join("\n\n");
+  return (kind === "all" ? ["agents", "skills", "commands", "hooks"] : [kind]).map((item) => {
+    const index = path.join(root, "index", `${item}.txt`);
+    const bundled = fs.existsSync(index) ? readTextFile(index) : "(missing index)";
+    if (item === "skills") return `[skills]\nAttached/local skills (take precedence over bundled skills):\n${localSkillSummary()}\n\nBundled skills:\n${bundled}`;
+    return `[${item}]\n${bundled}`;
+  }).join("\n\n");
 }
 
 export function readAgentResource({ path: resourcePath }) {
+  if (String(resourcePath).startsWith("skills/")) {
+    const root = path.resolve(mateHome(), "skills");
+    const target = path.resolve(mateHome(), resourcePath);
+    const actual = fs.realpathSync(target);
+    if ((target !== root && !target.startsWith(root + path.sep)) || (actual !== fs.realpathSync(root) && !actual.startsWith(fs.realpathSync(root) + path.sep))) throw new Error("path escapes local skills");
+    if (fs.statSync(target).isDirectory()) return fs.readdirSync(target).map((name) => path.posix.join(resourcePath, name)).join("\n") || "(empty)";
+    return readTextFile(target);
+  }
   const target = resolveInResources(resourcePath);
   if (fs.statSync(target).isDirectory()) return fs.readdirSync(target).map((name) => path.relative(resourceRoot(), path.join(target, name))).join("\n") || "(empty)";
   return readTextFile(target);
@@ -236,8 +263,10 @@ export function loadCommand({ command_name }) {
 }
 
 export function loadSkill({ skill_name }) {
-  const local = path.join(mateHome(), "skills", skill_name.trim(), "SKILL.md");
-  if (fs.existsSync(local)) return readTextFile(local);
+  const name = String(skill_name || "").trim();
+  if (!name || name === "." || name === ".." || /[\\/]/.test(name)) throw new Error("skill_name must be a skill folder name");
+  const local = path.join(mateHome(), "skills", name, "SKILL.md");
+  if (fs.existsSync(local)) return readAgentResource({ path: `skills/${name}/SKILL.md` });
   return loadIndexedResource("skills", (line, normalized) => line.includes(`/skills/${normalized}/SKILL.md`), skill_name, "skill");
 }
 
@@ -317,7 +346,9 @@ function loadIndexedResource(kind, matcher, name, label) {
 }
 
 function mateHome() {
-  return path.resolve(expandHome(process.env.MATE_HOME || path.join(os.homedir(), ".mate")));
+  const workspaceHome = path.join(activeWorkspace, ".mate");
+  const fallback = fs.existsSync(workspaceHome) ? workspaceHome : path.join(os.homedir(), ".mate");
+  return path.resolve(expandHome(process.env.MATE_HOME || fallback));
 }
 
 function resolveInWorkspace(value = ".") {

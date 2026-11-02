@@ -95,6 +95,11 @@ export class TerminalUI {
     console.log();
   }
 
+  static message(body) {
+    this.emitEvent("assistant.message", { markdown: String(body || ""), phase: "commentary" });
+    this.body(body);
+  }
+
   static answer(body, elapsedSeconds = null) {
     const title = elapsedSeconds === null ? "Result" : `Worked for ${this.formatDuration(elapsedSeconds)}`;
     this.emitEvent("assistant.message", { markdown: String(body || ""), elapsed_seconds: elapsedSeconds });
