@@ -1,0 +1,7 @@
+# Optional MCP server configuration for future Mate integrations.
+#
+# Example:
+# [servers.filesystem]
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/workspace"]
+# env = { LOG_LEVEL = "info" }

@@ -1,0 +1,48 @@
+[approval]
+# Set true only for trusted local sessions.
+auto_approve = false
+
+# Tools that always ask before running.
+require_tools = [
+  "run_command",
+  "start_background_process",
+]
+
+# Tools that may run without asking.
+allow_tools = [
+  "list_files",
+  "glob_files",
+  "read_file",
+  "search_files",
+]
+
+# Shell/git command patterns that may run without asking.
+allow_commands = [
+  "pwd",
+  "ls",
+  "ls *",
+  "rg *",
+  "git status*",
+  "git diff*",
+  "git log*",
+  "git show*",
+]
+
+# Command patterns that always ask unless explicitly allowed above.
+require_commands = [
+  "python -m pip install *",
+  "pip install *",
+  "npm install*",
+  "npm run*",
+  "git add*",
+  "git commit*",
+  "git push*",
+  "git pull*",
+  "git reset*",
+]
+
+[model]
+# Environment variables still take precedence when set.
+api_key_env = "OPENAI_API_KEY"
+base_url_env = "OPENAI_BASE_URL"
+model_env = "OPENAI_MODEL"

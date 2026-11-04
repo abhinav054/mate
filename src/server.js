@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import * as config from "./config.js";
 import { version } from "./version.js";
+import { buildSystemPrompt } from "./system_prompt.js";
 import * as tools from "./tools.js";
 import * as sessions from "./sessions.js";
 import { McpRegistry, loadMcpServers } from "./mcp.js";
@@ -164,10 +165,12 @@ export class AgentServer {
     const resourceRoot = tools.resourceRoot();
     const baseSystemMessage = {
       role: "system",
-      content: `You are Mate, a coding companion running in a terminal and compatible with the Codex app server activity model. Your workspace is ${workspacePath}. Mate config is loaded from ${mateConfig.mate_home}. Agent resources are available at ${resourceRoot}. Use tools to inspect, search, create, and edit files. Do not write outside the workspace. At the start of every session, first understand the project structure from the supplied project structure context and inspect any additional files needed before planning changes. Write user-facing responses as GitHub-flavored Markdown, not plain text. Keep final answers concise, with changed files and verification when code was modified. Mate emits Codex app server JSON-RPC notifications for activity and message events; shape your work so events map cleanly to plan, reasoning, command, files, and tool activity types. When browsing, use the browse_internet tool. Use list_agent_resources and read_agent_resource to discover and apply copied agents, skills, commands, hooks, and plugin guidance when relevant. Tool name mappings: LS=list_files, Glob=glob_files, Grep=search_files, Read=read_file, Write=write_file, Edit/MultiEdit=edit_file, Bash=run_command, TodoWrite=update_todos, Skill=load_skill, Task=load_agent_prompt, and slash commands=load_command. Use the git tool for Git status, diff, log, branch, show, add, commit, restore, and related operations instead of run_command. Use run_command for tests, formatting, and project inspection. After writing code, summarize the changed files and the verification you performed.
-Attached skills available in the active Mate config:
-${tools.localSkillSummary()}
-Before planning or executing service/environment setup, inspect the available skills and call load_skill for each relevant attached skill (including deploymate for Deploymate environment setup). Read any referenced supporting resources with read_agent_resource using their skills/<name>/ paths. Follow loaded skill instructions throughout setup; installed skills are not limited to bundled agent resources.`
+      content: buildSystemPrompt({
+        workspacePath,
+        configHome: mateConfig.mate_home,
+        resourceRoot,
+        attachedSkills: tools.localSkillSummary(),
+      })
     };
     const projectContext = tools.projectStructureSummary();
     const promptMessages = mateConfig.prompt_override ? [{ role: "system", content: mateConfig.prompt_override }] : [];
