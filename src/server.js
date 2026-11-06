@@ -4,6 +4,7 @@ import path from "node:path";
 import * as config from "./config.js";
 import { version } from "./version.js";
 import { assessAnswer as assessResult } from "./result_check.js";
+import { planningSummary } from "./planning.js";
 import { buildSystemPrompt } from "./system_prompt.js";
 import * as tools from "./tools.js";
 import * as sessions from "./sessions.js";
@@ -336,8 +337,9 @@ export class AgentServer {
     }
   }
 
-  async runAgentUntilAnswer() {
+  async runAgentUntilAnswer(userGoal = "") {
     let invalidToolRounds = 0;
+    let planningRounds = 0, totalPlanningRounds = 0;
     while (true) {
       this.throwIfInterrupted();
       await this.compactContextIfNeeded();
@@ -369,7 +371,21 @@ export class AgentServer {
       // Retain the original locally for diagnosis. safeToolHistory removes
       // rejected calls and their results from subsequent provider requests.
       this.messages.push(message);
-      if (!message.tool_calls || !message.tool_calls.length) return message.content || "";
+      if (!message.tool_calls || !message.tool_calls.length) {
+        const summary = planningSummary(message.content, userGoal);
+        if (!summary) return message.content || "";
+        this.ui.message(summary);
+        planningRounds++;
+        totalPlanningRounds++;
+        if (planningRounds >= 3 || totalPlanningRounds >= 8) {
+          throw new Error("Mate repeatedly returned planning text without completing the requested work. Stopped to avoid an endless continuation loop; the task remains incomplete.");
+        }
+        this.messages.push({ role: "user", content: "Harness feedback: your previous response described planned work, not a completed result. Continue the original request using the appropriate tools. Preserve work already done. If blocked or user input is required, explain that clearly instead of promising more work. Only finish when the requested work is complete; for setup, write the current-token manifest and verify readiness as instructed." });
+        continue;
+      }
+      planningRounds = 0;
+      const summary = planningSummary(message.content, userGoal);
+      if (summary) this.ui.message(summary);
       let invalidArguments = false;
       for (const toolCall of message.tool_calls) {
         this.throwIfInterrupted();
@@ -385,7 +401,7 @@ export class AgentServer {
     const maxChecks = Math.max(0, Number.parseInt(process.env.AGENT_HARNESS_MAX_RETRIES || "2", 10));
     for (let i = 0; i <= maxChecks; i++) {
       this.throwIfInterrupted();
-      const answer = await this.runAgentUntilAnswer();
+      const answer = await this.runAgentUntilAnswer(userGoal);
       this.throwIfInterrupted();
       if (i >= maxChecks) return answer;
       try {

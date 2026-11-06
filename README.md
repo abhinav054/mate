@@ -1,5 +1,13 @@
 # Mate
 
+Mate displays planning-only replies as progress and continues working in the same
+turn instead of treating a promise of action as completion. Repeated planning
+stops with an incomplete-task error after three consecutive replies or eight
+planning replies in one model loop. Explicit requests for a plan remain text
+answers. Thought-only replies display a short action summary. This is a
+conservative text heuristic; setup manifest and readiness validation still belong
+to the service runner.
+
 Mate opens the terminal UI by default. Launch `mate --workspace /path/to/project`
 (or `npm start`). `--ui terminal` is also accepted. The default workspace is the current directory.
 For server mode, use `mate app-server --listen stdio:// --workspace /path/to/project`

@@ -180,3 +180,32 @@ for (const interrupted of [false, true]) {
     } finally { input.end(); }
   });
 }
+
+test('planning progress reaches app-server clients before the final answer', async () => {
+  const { AgentServer } = await import('../src/server.js');
+  const workspace = mkdtempSync(join(tmpdir(), 'mate-planning-'));
+  const input = new PassThrough(), output = new PassThrough(), events = [];
+  let buffer = '', requests = 0;
+  output.on('data', chunk => {
+    buffer += chunk.toString();
+    const lines = buffer.split('\n'); buffer = lines.pop();
+    for (const line of lines) events.push(JSON.parse(line));
+  });
+  const server = runStdioServer({ workspace, input, output, createAgent: async (_workspace, ui) => {
+    const agent = new AgentServer({ client: { chat: { completions: { create: async () => ({ choices: [{ finish_reason: 'stop',
+      message: { role: 'assistant', content: requests++ === 0 ? "I'll check the project." : 'The project check is complete.' } }] }) } } },
+      model: 'test', ui, messages: [], mateConfig: { raw: {} } });
+    agent.compactContextIfNeeded = async () => {};
+    return agent;
+  }});
+  try {
+    const result = await rpc(input, output, 1, 'turn/start', { prompt: 'Check the project' });
+    assert.equal(result.result.markdown, 'The project check is complete.');
+    const completed = events.filter(e => e.method === 'item/completed').map(e => e.params.item);
+    assert.deepEqual(completed.map(item => [item.phase, item.text]), [
+      ['commentary', "I'll check the project."], ['final_answer', 'The project check is complete.']]);
+    assert.equal(events.filter(e => e.method === 'turn/completed').length, 1);
+    await rpc(input, output, 2, 'shutdown');
+    await server;
+  } finally { input.end(); rmSync(workspace, { recursive: true, force: true }); }
+});

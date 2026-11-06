@@ -1,6 +1,6 @@
 {
   "name": "mate",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "description": "Mate, a small OpenAI-compatible terminal coding companion with local file tools and curl-based browsing.",
   "type": "module",
   "files": [
