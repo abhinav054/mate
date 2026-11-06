@@ -432,3 +432,7 @@ Command, Git, browsing, and plugin tools default to a 15-minute execution timeou
 and accept `max_time_seconds` up to 7200 (2 hours). MCP tool calls wait up to
 2 hours and retain cancellation support. Explicit shorter tool timeouts are
 respected. Persistent development servers should still use background processes.
+Command, Git, and plugin-hook output streams to the workspace while the tool is
+running. Interrupts stop the command process group; timeouts appear as "Timed out"
+and preserve the captured output. Streaming does not turn a foreground server
+into a background process.

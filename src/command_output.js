@@ -1,4 +1,5 @@
 export function commandOutcome(name, output) {
+  if (/\[interrupted\]\s*$/.test(output)) return { status: "interrupted" };
   if (/^ERROR:/i.test(output)) return { status: "failed" };
   if (/\[timeout_seconds=\d+\](?:\n\[workspace_server_recorded=[^\n]*\])?\s*$|^\(command exceeded .* timeout\)/.test(output)) return { status: "timedOut" };
   const match = output.match(/\[exit_code=(-?\d+)\](?:\n\[workspace_server_recorded=[^\n]*\])?\s*$/) || output.match(/^\((?:command|git|hook) exited (-?\d+) with no output\)/) || output.match(/^\S+ exited\((-?\d+)\) pid=/);

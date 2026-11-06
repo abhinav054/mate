@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { commandOutcome } from './command_output.js';
+import { withCommandExecution } from './command_execution.js';
 
 const commands = new Set(['run_command', 'git', 'run_plugin_hook', 'start_background_process', 'read_background_process', 'write_background_process', 'stop_background_process', 'list_background_processes']);
 const limit = 32768;
@@ -28,8 +29,16 @@ export function installToolEvents(agent, publish, turn = () => null) {
     const started = Date.now();
     state.active = true;
     state.diffs = [];
-    let result, thrown;
-    try { result = await original(call); }
+    let result, thrown, streamed = 0;
+    const onOutput = delta => {
+      if (item.type !== 'commandExecution' || streamed > limit) return;
+      const text = delta.slice(0, limit - streamed);
+      streamed += text.length;
+      const truncated = delta.length > text.length ? '\n[Output truncated]' : '';
+      if (truncated) streamed++;
+      if (text || truncated) publish('item/commandExecution/outputDelta', { ...(current ? { turnId: current.id } : {}), itemId: item.id, delta: text + truncated });
+    };
+    try { result = await withCommandExecution({ onOutput }, () => original(call)); }
     catch (error) { thrown = error; }
     finally { state.active = false; }
     const content = thrown ? `ERROR: ${thrown.message || thrown}` : String(result?.content ?? '');
@@ -39,10 +48,10 @@ export function installToolEvents(agent, publish, turn = () => null) {
     const output = bounded([content, ...state.diffs].filter(Boolean).join('\n\n'));
     item = { ...item, status: failed ? 'failed' : 'completed', durationMs: Date.now() - started };
     if (item.type === 'commandExecution') {
-      item.status = declined ? 'declined' : item.status;
+      item.status = declined ? 'declined' : outcome.status === 'timedOut' ? 'timedOut' : outcome.status === 'interrupted' || agent.currentTurn?.interrupted ? 'interrupted' : item.status;
       item.exitCode = outcome.exitCode ?? null;
       item.aggregatedOutput = output;
-      if (output) publish('item/commandExecution/outputDelta', { ...(current ? { turnId: current.id } : {}), itemId: item.id, delta: output });
+      if (output && !streamed) publish('item/commandExecution/outputDelta', { ...(current ? { turnId: current.id } : {}), itemId: item.id, delta: output });
     } else if (item.type === 'mcpToolCall') {
       item.result = failed ? null : { content: [{ type: 'text', text: output }], structuredContent: null, _meta: null };
       item.error = failed ? { message: output } : null;

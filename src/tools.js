@@ -4,6 +4,7 @@ import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { DEFAULT_TOOL_TIMEOUT_SECONDS, MAX_TOOL_TIMEOUT_SECONDS, toolTimeoutSeconds } from "./timeouts.js";
+import { executeCommand } from "./command_execution.js";
 
 const MAX_TOOL_OUTPUT_CHARS = 16000;
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -82,9 +83,11 @@ export function globFiles({ pattern, path: targetPath = "." }) {
   return rows.join("\n") || "no matches";
 }
 
-export function readFile({ path: filePath }) {
+export function readFile({ path: filePath, max_lines }) {
+  if (max_lines !== undefined && (!Number.isSafeInteger(max_lines) || max_lines < 1 || max_lines > 10000)) throw new Error("max_lines must be an integer between 1 and 10000");
   const target = resolveInWorkspace(filePath);
   if (!fs.statSync(target).isFile()) throw new Error(`file does not exist: ${filePath}`);
+  if (max_lines !== undefined) return trimOutput(fs.readFileSync(target, "utf8").split(/\r?\n/).slice(0, max_lines).join("\n"));
   return readTextFile(target);
 }
 
@@ -116,25 +119,26 @@ export function editFile({ path: filePath, old_text, new_text, replace_all = fal
   return `edited ${relative(target)}; replacements=${replace_all ? count : 1}`;
 }
 
-export function runCommand({ command, cwd = ".", max_time_seconds = DEFAULT_TOOL_TIMEOUT_SECONDS }) {
+export async function runCommand({ command, cwd = ".", max_time_seconds = DEFAULT_TOOL_TIMEOUT_SECONDS }) {
   const workdir = checkedWorkdir(cwd);
   let recorded = "";
   if (looksLikeServerCommand(command)) recorded = recordWorkspaceServer({ command, cwd });
-  const result = spawnSync("bash", ["-lc", command], { cwd: workdir, encoding: "utf8", timeout: toolTimeoutSeconds(max_time_seconds) * 1000 });
-  let output = [result.stdout, result.stderr].filter(Boolean).join("\n");
-  const status = result.status === null || result.status === undefined ? 0 : result.status;
-  if (result.error && result.error.code === "ETIMEDOUT") output = output ? `${output}\n\n[timeout_seconds=${toolTimeoutSeconds(max_time_seconds)}]` : `(command exceeded ${toolTimeoutSeconds(max_time_seconds)}s timeout)`;
-  else output = output ? `${output}\n\n[exit_code=${status}]` : `(command exited ${status} with no output)`;
+  const result = await executeCommand("bash", ["-lc", command], { cwd: workdir, timeout: toolTimeoutSeconds(max_time_seconds) * 1000 });
+  let output = commandResult(result, "command", max_time_seconds);
   if (recorded) output += `\n[workspace_server_recorded=${WORKSPACE_SERVERS_FILE}]`;
-  return trimOutput(output);
+  return output;
 }
 
-export function git({ command, cwd = ".", max_time_seconds = DEFAULT_TOOL_TIMEOUT_SECONDS }) {
+export async function git({ command, cwd = ".", max_time_seconds = DEFAULT_TOOL_TIMEOUT_SECONDS }) {
   if (!which("git")) throw new Error("git is not installed");
-  const result = spawnSync("git", gitArgs(command), { cwd: checkedWorkdir(cwd), encoding: "utf8", timeout: toolTimeoutSeconds(max_time_seconds) * 1000 });
-  const output = [result.stdout, result.stderr].filter(Boolean).join("\n");
-  const status = result.status === null || result.status === undefined ? 0 : result.status;
-  return trimOutput(output ? `${output}\n\n[exit_code=${status}]` : `(git exited ${status} with no output)`);
+  const result = await executeCommand("git", gitArgs(command), { cwd: checkedWorkdir(cwd), timeout: toolTimeoutSeconds(max_time_seconds) * 1000 });
+  return commandResult(result, "git", max_time_seconds);
+}
+
+function commandResult(result, label, seconds) {
+  if (result.error) throw result.error;
+  const suffix = result.interrupted ? '[interrupted]' : result.timedOut ? `[timeout_seconds=${toolTimeoutSeconds(seconds)}]` : `[exit_code=${result.status ?? 1}]`;
+  return result.output ? `${trimOutput(result.output)}\n\n${suffix}` : result.interrupted || result.timedOut ? suffix : `(${label} exited ${result.status ?? 1} with no output)`;
 }
 
 export function startBackgroundProcess({ command, cwd = ".", process_id = null }) {
@@ -142,9 +146,7 @@ export function startBackgroundProcess({ command, cwd = ".", process_id = null }
   const id = (process_id || `bg-${new Date().toISOString().replace(/\D/g, "")}`).trim();
   if (backgroundProcesses.has(id)) throw new Error(`background process already exists: ${id}`);
   if (looksLikeServerCommand(command)) recordWorkspaceServer({ command, cwd });
-  const logRoot = process.env.AGENT_TERMINAL_LOG_ROOT || process.env.CODEX_TERMINAL_LOG_ROOT || path.join(os.tmpdir(), "codex-terminals");
-  fs.mkdirSync(logRoot, { recursive: true, mode: 0o700 });
-  const logFile = path.join(fs.mkdtempSync(path.join(logRoot, "mate-background-")), "stdout.log");
+  const logFile = createProcessLog("mate-background-");
   const output = fs.openSync(logFile, "a", 0o600);
   let child;
   try {
@@ -155,6 +157,12 @@ export function startBackgroundProcess({ command, cwd = ".", process_id = null }
   const entry = { command, cwd: workdir === activeWorkspace ? "." : relative(workdir), created_at: new Date().toISOString(), process: child, logFile };
   backgroundProcesses.set(id, entry);
   return `started ${id} running pid=${child.pid}\nStartup output:\n${readBackgroundOutput(entry, 40) || "(no output captured during startup wait)"}\nTo read stdout/stderr later, call read_background_process with process_id=${id}.`;
+}
+
+function createProcessLog(prefix) {
+  const logRoot = process.env.AGENT_TERMINAL_LOG_ROOT || process.env.CODEX_TERMINAL_LOG_ROOT || path.join(os.tmpdir(), "codex-terminals");
+  fs.mkdirSync(logRoot, { recursive: true, mode: 0o700 });
+  return path.join(fs.mkdtempSync(path.join(logRoot, prefix)), "stdout.log");
 }
 
 function readBackgroundOutput(entry, maxLines) {
@@ -298,13 +306,11 @@ export function updateTodos({ items_json }) {
   return todos.map((item) => `- [${item.status}] ${item.content}`).join("\n") || "(empty)";
 }
 
-export function runPluginHook({ plugin_name, hook_command, input_json = "{}", max_time_seconds = DEFAULT_TOOL_TIMEOUT_SECONDS }) {
+export async function runPluginHook({ plugin_name, hook_command, input_json = "{}", max_time_seconds = DEFAULT_TOOL_TIMEOUT_SECONDS }) {
   const pluginRoot = resolveInResources(`mate-plugins/${plugin_name}`);
   const env = { ...process.env, MATE_PLUGIN_ROOT: pluginRoot };
-  const result = spawnSync("bash", ["-lc", hook_command], { cwd: activeWorkspace, input: input_json, encoding: "utf8", timeout: toolTimeoutSeconds(max_time_seconds) * 1000, env });
-  const output = [result.stdout, result.stderr].filter(Boolean).join("\n");
-  const status = result.status === null || result.status === undefined ? 0 : result.status;
-  return trimOutput(output ? `${output}\n\n[exit_code=${status}]` : `(hook exited ${status} with no output)`);
+  const result = await executeCommand("bash", ["-lc", hook_command], { cwd: activeWorkspace, input: input_json, timeout: toolTimeoutSeconds(max_time_seconds) * 1000, env });
+  return commandResult(result, "hook", max_time_seconds);
 }
 
 export const TOOLS = {
@@ -320,7 +326,7 @@ function toolSchema(name) {
     list_files: { path: "string" },
     glob_files: { pattern: "string", path: "string" },
     git: { command: "string", cwd: "string", max_time_seconds: "integer" },
-    read_file: { path: "string" },
+    read_file: { path: "string", max_lines: "integer" },
     touch_file: { path: "string" },
     write_file: { path: "string", content: "string", append: "boolean" },
     edit_file: { path: "string", old_text: "string", new_text: "string", replace_all: "boolean" },
@@ -343,7 +349,7 @@ function toolSchema(name) {
   const spec = schemas[name] || {};
   return { ...common, properties: Object.fromEntries(Object.entries(spec).map(([key, type]) => [key,
     key === "max_time_seconds" ? { type, minimum: 1, maximum: MAX_TOOL_TIMEOUT_SECONDS, default: DEFAULT_TOOL_TIMEOUT_SECONDS,
-      description: "Optional execution timeout in seconds. Omit to allow 15 minutes; request up to 2 hours for longer work." } : { type }
+      description: "Optional execution timeout in seconds. Omit to allow 15 minutes; request up to 2 hours for longer work." } : name === "read_file" && key === "max_lines" ? { type, minimum: 1, maximum: 10000, description: "Optional maximum number of lines to read from the start of the file." } : { type }
   ])) };
 }
 

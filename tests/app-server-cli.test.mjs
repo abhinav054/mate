@@ -55,7 +55,7 @@ test('native Mate app-server owns commands, permissions, JSON events, usage and 
     requests++;
     if (requests === 2) assert.match(payload.messages.at(-1).content, /harness-marker/);
     if (requests === 3) assert.ok(payload.messages.some(m => m.role === 'assistant' && m.content === 'Verified harness-marker'));
-    const message = requests === 1 ? { role: 'assistant', content: null, tool_calls: [{ id: 'native-command', type: 'function', function: { name: 'run_command', arguments: JSON.stringify({ command: 'printf harness-marker', max_time_seconds: 5 }) } }] }
+    const message = requests === 1 ? { role: 'assistant', content: null, tool_calls: [{ id: 'native-command', type: 'function', function: { name: 'run_command', arguments: JSON.stringify({ command: 'printf harness-marker; sleep 0.6', max_time_seconds: 5 }) } }] }
       : { role: 'assistant', content: requests === 2 ? 'Verified harness-marker' : 'Resumed harness-marker' };
     response.writeHead(200, { 'content-type': 'application/json' });
     response.end(JSON.stringify({ id: 'fake-completion', object: 'chat.completion', choices: [{ index: 0, finish_reason: message.tool_calls ? 'tool_calls' : 'stop', message }], usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 } }));
@@ -68,11 +68,16 @@ test('native Mate app-server owns commands, permissions, JSON events, usage and 
   try {
     const first = launch(workspace, env); children.push(first);
     assert.equal((await first.rpc('initialize')).result.serverInfo.name, 'mate');
-    const completed = await first.rpc('turn/start', { prompt: 'Run the marker check' });
+    const pendingTurn = first.rpc('turn/start', { prompt: 'Run the marker check' });
+    const deadline = Date.now() + 3000;
+    while (!first.messages.some(m => m.method === 'item/commandExecution/outputDelta') && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
+    assert.ok(first.messages.some(m => m.method === 'item/commandExecution/outputDelta' && m.params.delta.includes('harness-marker')));
+    assert.ok(!first.messages.some(m => m.method === 'item/completed' && m.params.item.type === 'commandExecution'), 'stdio must stream before command completion');
+    const completed = await pendingTurn;
     assert.equal(completed.error, undefined, JSON.stringify(completed.error));
     assert.equal(completed.result.turn.status, 'completed');
     assert.equal(completed.result.turn.items.at(-1).text, 'Verified harness-marker');
-    const output = first.messages.find(m => m.method === 'item/completed' && m.params.item.type === 'commandExecution' && m.params.item.command === 'printf harness-marker' && m.params.item.status === 'completed');
+    const output = first.messages.find(m => m.method === 'item/completed' && m.params.item.type === 'commandExecution' && m.params.item.command === 'printf harness-marker; sleep 0.6' && m.params.item.status === 'completed');
     assert.match(output.params.item.aggregatedOutput, /harness-marker/);
     assert.equal(output.params.item.exitCode, 0);
     assert.equal(requests, 2); // app-server must not run another assessment pass.

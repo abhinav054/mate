@@ -3,9 +3,37 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { setWorkspace, startBackgroundProcess, readBackgroundProcess, stopBackgroundProcess } from '../src/tools.js';
+import { setWorkspace, runCommand, startBackgroundProcess, readBackgroundProcess, stopBackgroundProcess } from '../src/tools.js';
 
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
+test('regular shell commands keep background descendants output discoverable', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mate-command-test-'));
+  const previous = process.env.AGENT_TERMINAL_LOG_ROOT;
+  process.env.AGENT_TERMINAL_LOG_ROOT = path.join(root, 'logs');
+  setWorkspace(root);
+  let pid;
+  try {
+    const result = await runCommand({ command: `printf 'foreground output\\n'; python3 -u -c 'import time,sys; print("server stdout"); print("server stderr",file=sys.stderr); time.sleep(30)' & echo $! > child.pid` });
+    assert.match(result, /foreground output/);
+    assert.match(result, /exit_code=0/);
+    pid = Number(fs.readFileSync(path.join(root, 'child.pid'), 'utf8').trim());
+    const stdout = fs.readlinkSync(`/proc/${pid}/fd/1`);
+    assert.equal(stdout, fs.readlinkSync(`/proc/${pid}/fd/2`));
+    assert.equal(path.basename(stdout), 'stdout.log');
+    for (let attempt = 0; attempt < 100; attempt++) {
+      if (fs.readFileSync(stdout, 'utf8').includes('server stderr')) break;
+      await pause(20);
+    }
+    assert.match(fs.readFileSync(stdout, 'utf8'), /server stdout\nserver stderr/);
+    assert.match(await runCommand({ command: 'printf "failure output" >&2; exit 7' }), /failure output\n\n\[exit_code=7\]/);
+  } finally {
+    if (pid) { try { process.kill(pid, 'SIGKILL'); } catch {} }
+    if (previous === undefined) delete process.env.AGENT_TERMINAL_LOG_ROOT; else process.env.AGENT_TERMINAL_LOG_ROOT = previous;
+    setWorkspace(process.cwd());
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('background stdout and stderr use a discoverable file and remain readable through the tool', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mate-background-test-'));
   const previous = process.env.AGENT_TERMINAL_LOG_ROOT;

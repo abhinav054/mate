@@ -211,6 +211,31 @@ test('the actual list-files missing-brace response recovers without another mode
   assert.equal(requests,2);
 });
 
+for (const encoded of [false, true]) {
+  test(`read_file recovers the reported missing brace with max_lines (encoded=${encoded})`, async () => {
+    const raw = '{"path": "/workspace/app/main.py", "max_lines": 10';
+    let requests = 0;
+    const { agent, executed } = server(async ({ messages }) => {
+      if (++requests === 1) return { choices: [{ finish_reason: 'tool_calls', message: { role: 'assistant', tool_calls: [{
+        id: 'read', function: { name: 'read_file', arguments: encoded ? JSON.stringify(raw) : raw }
+      }] } }] };
+      assert.deepEqual(JSON.parse(messages[0].tool_calls[0].function.arguments), { path: '/workspace/app/main.py', max_lines: 10 });
+      return { choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: 'Read file' } }] };
+    });
+    assert.equal(await agent.runAgentUntilAnswer(), 'Read file');
+    assert.deepEqual(executed, [{ path: '/workspace/app/main.py', max_lines: 10 }]);
+    assert.equal(requests, 2);
+  });
+}
+
+for (const args of ['{"path":"a","max_lines":1e', '{"path":"a","max_lines":0', '{"path":"a","max_lines":10001', '{"path":"a","max_lines":10,"other":5']) {
+  test(`read_file does not guess invalid or unsupported numeric endings: ${args}`, async () => {
+    const { agent, executed } = server(async () => ({ choices: [{ finish_reason: 'tool_calls', message: { role: 'assistant', tool_calls: [{ id: 'bad', function: { name: 'read_file', arguments: args } }] } }] }));
+    await assert.rejects(agent.runAgentUntilAnswer(), /Stopped after three attempts/);
+    assert.deepEqual(executed, []);
+  });
+}
+
 for(const args of ['{"command":"unfinished','{"command":"echo ok","max_time_seconds":','{"max_time_seconds":6','{"value":tru','{"path":".",','{"path": ]']) {
   test(`incomplete values or invalid syntax are never guessed: ${args}`, async ()=>{
     const {agent,executed}=server(async ()=>({choices:[{finish_reason:'tool_calls',message:{role:'assistant',tool_calls:[call('bad',args)]}}]}));

@@ -9,6 +9,7 @@ import { buildSystemPrompt } from "./system_prompt.js";
 import * as tools from "./tools.js";
 import * as sessions from "./sessions.js";
 import { McpRegistry, loadMcpServers } from "./mcp.js";
+import { withCommandExecution } from "./command_execution.js";
 
 function preview(value, limit = 900) {
   const text = String(value || "").trim();
@@ -23,9 +24,19 @@ function jsonArguments(value) {
 }
 
 function closeToolArguments(call) {
-  const value = call.function?.arguments;
-  if (typeof value !== "string" || !value.trimStart().startsWith("{")) return call;
-  try { JSON.parse(value); return call; } catch { /* Check only missing closing delimiters. */ }
+  let value = call.function?.arguments;
+  if (typeof value !== "string") return call;
+  // Some providers serialize the argument object a second time as a JSON string.
+  try {
+    const parsed = JSON.parse(value);
+    if (typeof parsed === "string" && parsed.trimStart().startsWith("{")) value = parsed;
+    else return call;
+  } catch { /* Check only missing closing delimiters. */ }
+  if (!value.trimStart().startsWith("{")) return call;
+  try {
+    jsonArguments(value);
+    return { ...call, function: { ...call.function, arguments: value } };
+  } catch { /* Continue with delimiter-only recovery. */ }
   const stack = [];
   let quoted = false, escaped = false;
   for (const char of value) {
@@ -42,9 +53,17 @@ function closeToolArguments(call) {
   if (quoted || escaped || !stack.length) return call;
   // A number ending at EOF might itself be truncated (6 versus 600).
   // Only close values with an unambiguous token boundary.
-  if (!/["\]}]\s*$|(?:true|false|null)\s*$/.test(value)) return call;
   const complete = value + stack.reverse().join("");
-  try { jsonArguments(complete); } catch { return call; }
+  let parsed;
+  try { parsed = jsonArguments(complete); } catch { return call; }
+  if (!/["\]}]\s*$|(?:true|false|null)\s*$/.test(value)) {
+    // A read-only line limit can use its literal supplied integer. Never apply
+    // this exception to timeouts, commands, mutations, or arbitrary MCP tools.
+    if (call.function.name !== "read_file" || !/"max_lines"\s*:\s*[1-9]\d*\s*$/.test(value)
+        || typeof parsed.path !== "string" || !Number.isSafeInteger(parsed.max_lines)
+        || parsed.max_lines < 1 || parsed.max_lines > 10000
+        || Object.keys(parsed).some(key => !["path", "max_lines"].includes(key))) return call;
+  }
   return { ...call, function: { ...call.function, arguments: complete } };
 }
 
@@ -296,7 +315,7 @@ export class AgentServer {
       else {
         const fn = tools.TOOLS[name];
         if (!fn) throw new Error(`unknown tool: ${name}`);
-        result = await fn(args);
+        result = await withCommandExecution({ signal: this.currentTurn?.controller.signal }, () => fn(args));
       }
     } catch (error) {
       failed = true;
@@ -366,7 +385,7 @@ export class AgentServer {
         continue;
       }
       if (message.tool_calls?.some((call, index) => call !== choice.message.tool_calls[index])) {
-        this.ui.activity("Recovered tool arguments", "Completed missing closing delimiters; argument values were preserved", this.ui.YELLOW, "reasoning");
+        this.ui.activity("Recovered tool arguments", "Normalized JSON encoding or completed missing closing delimiters; argument values were preserved", this.ui.YELLOW, "reasoning");
       }
       // Retain the original locally for diagnosis. safeToolHistory removes
       // rejected calls and their results from subsequent provider requests.
