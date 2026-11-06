@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import * as config from "./config.js";
 import { version } from "./version.js";
+import { assessAnswer as assessResult } from "./result_check.js";
 import { buildSystemPrompt } from "./system_prompt.js";
 import * as tools from "./tools.js";
 import * as sessions from "./sessions.js";
@@ -18,6 +19,43 @@ function jsonArguments(value) {
   const parsed = JSON.parse(value || "{}");
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("tool arguments must be a JSON object");
   return parsed;
+}
+
+function closeToolArguments(call) {
+  const value = call.function?.arguments;
+  if (typeof value !== "string" || !value.trimStart().startsWith("{")) return call;
+  try { JSON.parse(value); return call; } catch { /* Check only missing closing delimiters. */ }
+  const stack = [];
+  let quoted = false, escaped = false;
+  for (const char of value) {
+    if (quoted) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') quoted = false;
+    } else if (char === '"') quoted = true;
+    else if (char === "{") stack.push("}");
+    else if (char === "[") stack.push("]");
+    else if (char === "}" || char === "]") { if (stack.pop() !== char) return call; }
+  }
+  // Never invent a string ending, field value, comma, or command content.
+  if (quoted || escaped || !stack.length) return call;
+  // A number ending at EOF might itself be truncated (6 versus 600).
+  // Only close values with an unambiguous token boundary.
+  if (!/["\]}]\s*$|(?:true|false|null)\s*$/.test(value)) return call;
+  const complete = value + stack.reverse().join("");
+  try { jsonArguments(complete); } catch { return call; }
+  return { ...call, function: { ...call.function, arguments: complete } };
+}
+
+function toolArguments(call) {
+  const args = jsonArguments(call.function.arguments);
+  const properties = tools.TOOL_DEFINITIONS.find((tool) => tool.function.name === call.function.name)?.function.parameters.properties || {};
+  for (const [name, schema] of Object.entries(properties)) {
+    if (!["integer", "number"].includes(schema.type) || args[name] === undefined) continue;
+    const value = args[name];
+    if (typeof value !== "number" || !Number.isFinite(value) || (schema.type === "integer" && !Number.isSafeInteger(value))) throw new Error(`Invalid numeric argument: ${name}`);
+  }
+  return args;
 }
 
 function estimateTokens(messages) {
@@ -242,13 +280,18 @@ export class AgentServer {
     let result = "";
     let args = {};
     try {
-      args = jsonArguments(toolCall.function.arguments);
+      try {
+        args = toolArguments(toolCall);
+      } catch (error) {
+        const reason = /unexpected end|unterminated/i.test(error.message) ? "The JSON was incomplete or truncated." : "The JSON syntax or object type was invalid.";
+        throw new Error(`Invalid tool arguments for ${name}. ${reason} No tool was executed. Regenerate the complete JSON object, including its closing quote and brace. Escape quotes and newlines inside string values; keep shell commands short.`);
+      }
       this.ui.activity("Working", describeToolStart(name, args), this.ui.MAGENTA, activityTypeForTool(name));
       const command = String(args.command || "");
       let requiresApproval = config.toolRequiresApproval(this.config, name, command);
       if (name === "git" && tools.gitRequiresApproval(command)) requiresApproval = !config.toolAllowedWithoutApproval(this.config, name, `git ${command}`);
       if (requiresApproval && !(await this.confirmToolExecution(name, args))) throw new Error("user denied command approval");
-      if (this.mcpRegistry && this.mcpRegistry.hasTool(name)) result = await this.mcpRegistry.callTool(name, args);
+      if (this.mcpRegistry && this.mcpRegistry.hasTool(name)) result = await this.mcpRegistry.callTool(name, args, { signal: this.currentTurn?.controller.signal });
       else {
         const fn = tools.TOOLS[name];
         if (!fn) throw new Error(`unknown tool: ${name}`);
@@ -294,19 +337,47 @@ export class AgentServer {
   }
 
   async runAgentUntilAnswer() {
+    let invalidToolRounds = 0;
     while (true) {
       this.throwIfInterrupted();
       await this.compactContextIfNeeded();
       this.throwIfInterrupted();
       const response = await this.createChatCompletionWithRetry({ label: "model request", model: this.model, messages: this.messages, tools: [...tools.TOOL_DEFINITIONS, ...((this.mcpRegistry && this.mcpRegistry.toolDefinitions) || [])], tool_choice: "auto" });
       this.throwIfInterrupted();
-      const message = response.choices[0].message;
+      const choice = response?.choices?.[0];
+      // Never treat a delta, a token-limited completion, or a response without
+      // a terminal finish reason as a complete tool call, even if JSON parses.
+      if (!choice?.message || !["stop", "tool_calls"].includes(choice.finish_reason)) {
+        throw new Error("The model response was incomplete or interrupted. No tools from this response were executed. Retry the turn or increase the model output limit.");
+      }
+      const message = choice.message.tool_calls?.length
+        ? { ...choice.message, tool_calls: choice.message.tool_calls.map(closeToolArguments) }
+        : choice.message;
+      if (invalidToolRounds > 0 && !message.tool_calls?.length) {
+        // A rejected call did not execute. Unrelated prose (or an unsupported
+        // success claim) cannot resolve it or complete an environment setup.
+        // Do not publish or retain this answer as conversation evidence.
+        invalidToolRounds++;
+        if (invalidToolRounds >= 3) throw new Error("The model could not recover its rejected tool call after three attempts. No rejected tool was executed; the requested action remains incomplete.");
+        this.messages.push({ role: "user", content: "Harness feedback: the previous tool request was rejected and did not execute. Continue the original task using the appropriate tool. Keep the call short and omit optional parameters unless necessary. A text answer does not complete the pending action. Do not claim work that has not run." });
+        this.ui.activity("Recovering tool request", "The previous request did not execute; asking the model to continue the pending action", this.ui.YELLOW, "reasoning");
+        continue;
+      }
+      if (message.tool_calls?.some((call, index) => call !== choice.message.tool_calls[index])) {
+        this.ui.activity("Recovered tool arguments", "Completed missing closing delimiters; argument values were preserved", this.ui.YELLOW, "reasoning");
+      }
+      // Retain the original locally for diagnosis. safeToolHistory removes
+      // rejected calls and their results from subsequent provider requests.
       this.messages.push(message);
       if (!message.tool_calls || !message.tool_calls.length) return message.content || "";
+      let invalidArguments = false;
       for (const toolCall of message.tool_calls) {
         this.throwIfInterrupted();
+        try { toolArguments(toolCall); } catch { invalidArguments = true; }
         this.messages.push(await this.toolMessage(toolCall));
       }
+      invalidToolRounds = invalidArguments ? invalidToolRounds + 1 : 0;
+      if (invalidToolRounds >= 3) throw new Error("The model repeatedly returned incomplete or invalid tool arguments. Stopped after three attempts; retry the turn or choose another model.");
     }
   }
 
@@ -384,28 +455,30 @@ export class AgentServer {
   }
 
   async assessAnswer(userGoal, answer) {
-    this.throwIfInterrupted();
-    const response = await this.createChatCompletionWithRetry({
-      label: "result check",
-      model: this.model,
-      messages: [
-        { role: "system", content: "You are a strict production result checker for Mate. Return only JSON with keys: aligned, can_improve_with_tools, reason, follow_up_prompt." },
-        { role: "user", content: `User prompt:\n${userGoal}\n\nCandidate response:\n${answer}\n\nAssess whether the response is complete, directly responsive, and honest about verification.` }
-      ],
-      response_format: { type: "json_object" }
-    });
-    this.throwIfInterrupted();
-    return extractJsonObject(response.choices[0].message.content || "{}");
+    return assessResult.call(this, userGoal, answer);
   }
 
   async createChatCompletionWithRetry({ label, ...kwargs }) {
+    // Tool execution consumes complete messages, never SSE deltas. Await the
+    // SDK's full JSON response instead of opting into a streaming iterator.
+    kwargs = { ...kwargs, stream: false };
+    if (kwargs.messages) kwargs = { ...kwargs, messages: safeToolHistory(kwargs.messages) };
     const maxRetries = Math.max(0, Number.parseInt(process.env.AGENT_MODEL_RATE_LIMIT_RETRIES || "2", 10));
+    let retriedInvalidJson = false;
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       try {
         this.throwIfInterrupted();
         return await this.client.chat.completions.create(kwargs, this.currentTurn?.controller ? { signal: this.currentTurn.controller.signal } : undefined);
       } catch (error) {
         if (this.isInterruptedError(error)) throw new TurnInterruptedError();
+        // Some providers reject malformed generated tool JSON before returning
+        // a completion. No tools have run for this request, so retry once.
+        if (error.status === 400 && !retriedInvalidJson && /Expecting ',' delimiter|Unterminated string|Expecting property name enclosed in double quotes/i.test(String(error.message))) {
+          retriedInvalidJson = true;
+          attempt--;
+          this.ui.activity("Retrying model request", "The model returned invalid JSON; requesting a new response", this.ui.YELLOW, "reasoning");
+          continue;
+        }
         if (error.status !== 429 || attempt >= maxRetries) throw error;
         const delay = Math.min(2 ** attempt, Number.parseFloat(process.env.AGENT_MODEL_RATE_LIMIT_MAX_DELAY_SECONDS || "30"));
         this.ui.activity("Rate limited", `${label}; retrying in ${this.ui.formatDuration(delay)}`, this.ui.YELLOW, "reasoning");
@@ -416,13 +489,29 @@ export class AgentServer {
   }
 }
 
-function extractJsonObject(value) {
-  let text = value.trim();
-  if (text.startsWith("```")) text = text.split(/\r?\n/).filter((line) => !line.trim().startsWith("```")).join("\n").trim();
-  const start = text.indexOf("{");
-  const end = text.lastIndexOf("}");
-  if (start === -1 || end < start) throw new Error("no JSON object found");
-  return JSON.parse(text.slice(start, end + 1));
+function safeToolHistory(messages) {
+  // Also recognize errors persisted by the previous release, which replaced
+  // invalid arguments with {}. Never teach the model to repeat empty calls.
+  const rejected = new Set(messages.filter((m) => m.role === "tool" && /^ERROR: Error: Invalid tool arguments/.test(m.content || "")).map((m) => m.tool_call_id));
+  for (const message of messages) {
+    if (message.role !== "assistant") continue;
+    for (const call of message.tool_calls || []) {
+      try {
+        jsonArguments(call.function.arguments);
+      } catch {
+        rejected.add(call.id);
+      }
+    }
+  }
+  return messages.flatMap((message) => {
+    if (message.role === "tool" && rejected.has(message.tool_call_id)) return [];
+    if (message.role !== "assistant" || !message.tool_calls?.some((c) => rejected.has(c.id))) return [message];
+    const tool_calls = message.tool_calls.filter((c) => !rejected.has(c.id));
+    const names = [...new Set(message.tool_calls.filter((c) => rejected.has(c.id)).map((c) => c.function?.name))];
+    const feedback = `Tool calls rejected (${names.join(", ")}): incomplete or invalid JSON arguments; these tools did not execute. Return a complete JSON object with closing quotes and braces. Escape embedded quotes and newlines. Use short commands and smaller file writes.`;
+    // Keep valid siblings and their tool results together before feedback.
+    return [{ ...message, tool_calls: tool_calls.length ? tool_calls : undefined, content: [message.content, feedback].filter(Boolean).join("\n") }];
+  });
 }
 
 function activityTypeForTool(name) {

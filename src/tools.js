@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { DEFAULT_TOOL_TIMEOUT_SECONDS, MAX_TOOL_TIMEOUT_SECONDS, toolTimeoutSeconds } from "./timeouts.js";
 
 const MAX_TOOL_OUTPUT_CHARS = 16000;
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -115,22 +116,22 @@ export function editFile({ path: filePath, old_text, new_text, replace_all = fal
   return `edited ${relative(target)}; replacements=${replace_all ? count : 1}`;
 }
 
-export function runCommand({ command, cwd = ".", max_time_seconds = 30 }) {
+export function runCommand({ command, cwd = ".", max_time_seconds = DEFAULT_TOOL_TIMEOUT_SECONDS }) {
   const workdir = checkedWorkdir(cwd);
   let recorded = "";
   if (looksLikeServerCommand(command)) recorded = recordWorkspaceServer({ command, cwd });
-  const result = spawnSync("bash", ["-lc", command], { cwd: workdir, encoding: "utf8", timeout: clamp(max_time_seconds, 1, 120) * 1000 });
+  const result = spawnSync("bash", ["-lc", command], { cwd: workdir, encoding: "utf8", timeout: toolTimeoutSeconds(max_time_seconds) * 1000 });
   let output = [result.stdout, result.stderr].filter(Boolean).join("\n");
   const status = result.status === null || result.status === undefined ? 0 : result.status;
-  if (result.error && result.error.code === "ETIMEDOUT") output = output ? `${output}\n\n[timeout_seconds=${clamp(max_time_seconds, 1, 120)}]` : `(command exceeded ${clamp(max_time_seconds, 1, 120)}s timeout)`;
+  if (result.error && result.error.code === "ETIMEDOUT") output = output ? `${output}\n\n[timeout_seconds=${toolTimeoutSeconds(max_time_seconds)}]` : `(command exceeded ${toolTimeoutSeconds(max_time_seconds)}s timeout)`;
   else output = output ? `${output}\n\n[exit_code=${status}]` : `(command exited ${status} with no output)`;
   if (recorded) output += `\n[workspace_server_recorded=${WORKSPACE_SERVERS_FILE}]`;
   return trimOutput(output);
 }
 
-export function git({ command, cwd = ".", max_time_seconds = 30 }) {
+export function git({ command, cwd = ".", max_time_seconds = DEFAULT_TOOL_TIMEOUT_SECONDS }) {
   if (!which("git")) throw new Error("git is not installed");
-  const result = spawnSync("git", gitArgs(command), { cwd: checkedWorkdir(cwd), encoding: "utf8", timeout: clamp(max_time_seconds, 1, 120) * 1000 });
+  const result = spawnSync("git", gitArgs(command), { cwd: checkedWorkdir(cwd), encoding: "utf8", timeout: toolTimeoutSeconds(max_time_seconds) * 1000 });
   const output = [result.stdout, result.stderr].filter(Boolean).join("\n");
   const status = result.status === null || result.status === undefined ? 0 : result.status;
   return trimOutput(output ? `${output}\n\n[exit_code=${status}]` : `(git exited ${status} with no output)`);
@@ -187,9 +188,9 @@ export async function requestUserInput({ prompt, secret = false, default: defaul
   return value || defaultValue || "(no input provided)";
 }
 
-export function browseInternet({ url, max_time_seconds = 20 }) {
+export function browseInternet({ url, max_time_seconds = DEFAULT_TOOL_TIMEOUT_SECONDS }) {
   if (!String(url).startsWith("http://") && !String(url).startsWith("https://")) throw new Error("url must start with http:// or https://");
-  const result = spawnSync("curl", ["--location", "--silent", "--show-error", "--max-time", String(clamp(max_time_seconds, 1, 60)), url], { encoding: "utf8" });
+  const result = spawnSync("curl", ["--location", "--silent", "--show-error", "--max-time", String(toolTimeoutSeconds(max_time_seconds)), url], { encoding: "utf8" });
   return trimOutput(result.stdout || result.stderr || "");
 }
 
@@ -281,10 +282,10 @@ export function updateTodos({ items_json }) {
   return todos.map((item) => `- [${item.status}] ${item.content}`).join("\n") || "(empty)";
 }
 
-export function runPluginHook({ plugin_name, hook_command, input_json = "{}", max_time_seconds = 30 }) {
+export function runPluginHook({ plugin_name, hook_command, input_json = "{}", max_time_seconds = DEFAULT_TOOL_TIMEOUT_SECONDS }) {
   const pluginRoot = resolveInResources(`mate-plugins/${plugin_name}`);
   const env = { ...process.env, MATE_PLUGIN_ROOT: pluginRoot };
-  const result = spawnSync("bash", ["-lc", hook_command], { cwd: activeWorkspace, input: input_json, encoding: "utf8", timeout: clamp(max_time_seconds, 1, 180) * 1000, env });
+  const result = spawnSync("bash", ["-lc", hook_command], { cwd: activeWorkspace, input: input_json, encoding: "utf8", timeout: toolTimeoutSeconds(max_time_seconds) * 1000, env });
   const output = [result.stdout, result.stderr].filter(Boolean).join("\n");
   const status = result.status === null || result.status === undefined ? 0 : result.status;
   return trimOutput(output ? `${output}\n\n[exit_code=${status}]` : `(hook exited ${status} with no output)`);
@@ -324,7 +325,10 @@ function toolSchema(name) {
     record_workspace_server: { command: "string", cwd: "string", reason: "string" }
   };
   const spec = schemas[name] || {};
-  return { ...common, properties: Object.fromEntries(Object.entries(spec).map(([key, type]) => [key, { type }])) };
+  return { ...common, properties: Object.fromEntries(Object.entries(spec).map(([key, type]) => [key,
+    key === "max_time_seconds" ? { type, minimum: 1, maximum: MAX_TOOL_TIMEOUT_SECONDS, default: DEFAULT_TOOL_TIMEOUT_SECONDS,
+      description: "Optional execution timeout in seconds. Omit to allow 15 minutes; request up to 2 hours for longer work." } : { type }
+  ])) };
 }
 
 function recordWorkspaceServer({ command, cwd = ".", reason = "server command detected" }) {

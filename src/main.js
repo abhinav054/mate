@@ -7,10 +7,14 @@ import * as sessions from "./sessions.js";
 const steeringPrompts = [];
 
 function parseArgs(argv) {
-  const args = { command: null, workspace_arg: null, workspace_option: null, stdio: false };
+  const args = { command: null, workspace_arg: null, workspace_option: null, stdio: false, checkStartup: false };
   for (let i = 0; i < argv.length; i++) {
     const item = argv[i];
     if (["--stdio", "--server", "app-server"].includes(item)) args.stdio = true;
+    else if (item === "--listen") {
+      if (argv[++i] !== "stdio://") throw new Error("--listen only supports stdio://");
+      args.stdio = true;
+    } else if (item === "--check-startup") args.checkStartup = true;
     else if (item === "--workspace") {
       if (!argv[i + 1] || argv[i + 1].startsWith("-")) throw new Error("--workspace requires a path");
       args.workspace_option = argv[++i];
@@ -106,6 +110,11 @@ function expandSlashCommand(userInput) {
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const workspace = path.resolve(resolveWorkspace(args));
+  if (args.checkStartup) {
+    const { checkStartup } = await import("./startup_check.js");
+    await checkStartup();
+    return;
+  }
   if (args.stdio) {
     const { runStdioServer } = await import("./stdio.js");
     await runStdioServer({ workspace });

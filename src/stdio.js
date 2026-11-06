@@ -1,7 +1,21 @@
 import readline from "node:readline";
-import { TurnInterruptedError } from "./server.js";
+import { randomUUID } from "node:crypto";
+import { installProjectEnvironment } from "./project_environment.js";
+installProjectEnvironment();
+import { readFileSync } from "node:fs";
+import { installToolEvents } from "./tool_events.js";
+import { installPermissions } from "./permissions.js";
+import { installSkillDiscovery } from "./skill_discovery.js";
+import { installMateUsage } from "./usage.js";
+// Native Mate app-server harness, including saved-conversation resume.
+import { AgentServer, TurnInterruptedError } from "./server.js";
+import * as sessions from "./sessions.js";
+import { mateHome } from "./config.js";
+import { join } from "node:path";
 
 export async function runStdioServer({ workspace, input = process.stdin, output = process.stdout, createAgent } = {}) {
+  // App-server turns finish after the answer; no automatic assessment pass.
+  process.env.AGENT_HARNESS_MAX_RETRIES = "0";
   let closed = false;
   const handlers = new Set();
   const send = (message) => { if (!closed) output.write(JSON.stringify({ jsonrpc: "2.0", ...message }) + "\n"); };
@@ -10,7 +24,21 @@ export async function runStdioServer({ workspace, input = process.stdin, output 
   let nextId = 0;
   let agent;
   let active = false;
+  let setup = false;
+  let policy = { permissions: {}, mcp: {} };
+  try { policy = JSON.parse(readFileSync(process.env.MATE_PERMISSIONS_FILE || join(mateHome(), "permissions.json"), "utf8")); }
+  catch (error) { if (error.code !== "ENOENT") throw error; }
   let activeTurnRequestId = null;
+  let currentTurn = null;
+  let toolEvents = null;
+  const assistantMessage = (text, phase = "commentary") => {
+    const item = { id: `mate-message-${randomUUID()}`, type: "agentMessage", text: String(text ?? ""), phase };
+    const params = { ...(currentTurn ? { turnId: currentTurn.id } : {}), item };
+    notify("item/started", params);
+    if (currentTurn) currentTurn.items.push(item);
+    notify("item/completed", params);
+    return item;
+  };
   const request = (method, params) => new Promise((resolve, reject) => {
     if (closed) { reject(new Error("Client disconnected")); return; }
     const id = `mate-${++nextId}`;
@@ -19,10 +47,10 @@ export async function runStdioServer({ workspace, input = process.stdin, output 
   });
   const ui = {
     banner() {},
-    message: (markdown) => notify("codex.assistant.message", { markdown, phase: "commentary" }),
+    message: (markdown) => assistantMessage(markdown),
     panel: (title, detail) => notify("codex.activity", { type: "reasoning", title, detail }),
-    activity: (title, detail, color, type = "tool") => notify("codex.activity", { type, title, detail }),
-    diff: (detail) => notify("codex.activity", { type: "files", title: "File Diff", detail }),
+    activity: (title, detail, color, type = "tool", metadata = {}) => { if (!toolEvents?.active) notify("codex.activity", { ...metadata, type, title, detail }); },
+    diff: (detail) => { if (toolEvents?.active) toolEvents.diff(detail); else notify("codex.activity", { type: "files", title: "File Diff", detail }); },
     success: (detail) => notify("codex.activity", { type: "tool", title: "Completed", detail }),
     warning: (detail) => notify("codex.activity", { type: "tool", title: "Warning", detail }),
     prompt: async (prompt, secret = false) => {
@@ -65,7 +93,7 @@ export async function runStdioServer({ workspace, input = process.stdin, output 
       respond({ interrupted });
       return;
     }
-    if (!["turn/start", "conversation/reset"].includes(message.method)) { fail(-32601, "Method not found"); return; }
+    if (!["turn/start", "conversation/reset", "conversation/resume"].includes(message.method)) { fail(-32601, "Method not found"); return; }
     if (active) { fail(-32000, "A turn is running"); return; }
     const params = message.params || {};
     const prompt = params.prompt ?? (Array.isArray(params.input) ? params.input.filter((item) => item.type === "text").map((item) => item.text).join("\n") : undefined);
@@ -74,20 +102,44 @@ export async function runStdioServer({ workspace, input = process.stdin, output 
     activeTurnRequestId = Object.hasOwn(message, "id") ? message.id : null;
     try {
       if (!agent) {
-        const factory = createAgent || (await import("./server.js")).AgentServer.create;
-        agent = await factory(workspace, ui, { showStartup: false });
+        const factory = createAgent || AgentServer.create;
+        const options = { showStartup: false };
+        if (message.method === "conversation/resume") {
+          const saved = sessions.latestSession(workspace);
+          if (!saved) throw new Error("No saved Mate conversation was found in the restored snapshot");
+          options.session = saved;
+          options.resumeMessages = sessions.readSessionMessages(saved);
+        }
+        agent = installSkillDiscovery(await factory(workspace, ui, options));
+        installMateUsage(agent.client);
+        installPermissions(agent, policy, { setup: () => setup, approve: async (tool) => (await request("mate/approval/request", { prompt: `Allow ${tool}?` }))?.approved === true });
+        toolEvents = installToolEvents(agent, notify, () => currentTurn);
+      }
+      if (message.method === "conversation/resume") {
+        respond({ resumed: true }); return;
       }
       if (message.method === "conversation/reset") { agent.reset(); respond(null); return; }
       notify("codex.user.message", { markdown: prompt });
       const started = Date.now();
-      const markdown = await agent.runTurn(prompt);
-      notify("codex.assistant.message", { markdown, elapsed_seconds: (Date.now() - started) / 1000 });
-      respond({ markdown });
+      setup = params.cmSetup === true;
+      currentTurn = { id: `mate-turn-${randomUUID()}`, status: "inProgress", items: [], error: null };
+      notify("turn/started", { turn: { ...currentTurn, items: [] } });
+      const markdown = String((await agent.runTurn(prompt)) ?? "");
+      assistantMessage(markdown, "final_answer");
+      currentTurn.status = "completed";
+      notify("turn/completed", { turn: currentTurn, elapsed_seconds: (Date.now() - started) / 1000 });
+      // Keep markdown for existing clients; Codex-style consumers use turn.items.
+      respond({ markdown, turn: currentTurn });
     } catch (error) {
+      if (currentTurn) {
+        currentTurn.status = error instanceof TurnInterruptedError ? "interrupted" : "failed";
+        currentTurn.error = { message: error.message };
+        notify("turn/completed", { turn: currentTurn });
+      }
       if (error instanceof TurnInterruptedError) fail(-32800, error.message);
       else fail(-32603, error.message);
     }
-    finally { active = false; activeTurnRequestId = null; }
+    finally { currentTurn = null; setup = false; active = false; activeTurnRequestId = null; }
   }
   lines.on("line", (line) => {
     if (closed) return;

@@ -52,7 +52,7 @@ Use write_file to create new files or when replacing essentially all of a small 
 
 ### Git, commands, and processes
 
-Use the git tool for Git status, diff, log, show, branch, add, commit, restore, and other Git operations. Use run_command for project inspection, builds, tests, linters, and formatters. Set the correct cwd and a bounded max_time_seconds; run_command has a maximum timeout of 120 seconds. Inspect exit_code, timeout markers, stderr, and trimmed-output indicators. Missing output or a timeout is not success.
+Use the git tool for Git status, diff, log, show, branch, add, commit, restore, and other Git operations. Use run_command for project inspection, builds, tests, linters, and formatters. Set the correct cwd. Command, Git, browsing, and plugin tools allow 15 minutes by default and up to 2 hours. Omit max_time_seconds unless a different bounded timeout is needed; do not use short timeouts for dependency installation, builds, or test suites. Inspect exit_code, timeout markers, stderr, and trimmed-output indicators. Missing output or a timeout is not success.
 
 Use start_background_process for a necessary long-running server or task; retain its process_id and inspect it with list_background_processes and read_background_process. Use write_background_process for intentional input and stop_background_process for cleanup of processes you created. Never kill unrelated processes or leave unnecessary background jobs running.
 
@@ -98,5 +98,5 @@ A task is complete only when all applicable conditions hold:
 5. When deployment or publishing is authorized and requested, verify the actual deployed revision, rollout/readiness, and an appropriate health or behavior check. A successful local build alone does not prove deployment.
 6. Necessary documentation is updated, tracked background tasks are resolved or intentionally retained, and the final response states the outcome, important changed files, verification, and any unresolved limitation in concise GitHub-flavored Markdown.
 
-Mate emits Codex-compatible JSON-RPC notifications. Use normal tool and activity channels for commands, edits, plans, skill use, and results. Do not fabricate protocol events or place tool-call JSON in ordinary prose as a substitute for invoking tools. Keep the final response separate from the pre-tool <thought> summaries; do not include private reasoning in either. Follow an explicit user-requested final format when compatible with these instructions.`;
+Use the provided tools for commands, edits, plans, skill use, and results. Respond to the user in plain language. The harness handles tool arguments, activity events, and response serialization; do not imitate tool calls or protocol events in ordinary prose. Keep the final response separate from the pre-tool <thought> summaries; do not include private reasoning in either. Follow an explicit user-requested final format when compatible with these instructions.`;
 }

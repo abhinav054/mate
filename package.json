@@ -1,6 +1,6 @@
 {
   "name": "mate",
-  "version": "0.1.0",
+  "version": "2.1.0",
   "description": "Mate, a small OpenAI-compatible terminal coding companion with local file tools and curl-based browsing.",
   "type": "module",
   "files": [
@@ -15,9 +15,10 @@
   },
   "scripts": {
     "start": "node src/main.js",
-    "server": "node src/main.js --stdio",
+    "server": "node src/main.js app-server --listen stdio://",
     "check": "npm run smoke",
-    "smoke": "node --check src/main.js && node --check src/server.js && node --check src/sessions.js && node --check src/tools.js && node --check src/config.js && node --check src/mcp.js && node --check src/ui.js"
+    "smoke": "node --check src/command_output.js && node --check src/config.js && node --check src/main.js && node --check src/mcp.js && node --check src/permissions.js && node --check src/project_environment.js && node --check src/result_check.js && node --check src/server.js && node --check src/sessions.js && node --check src/skill_discovery.js && node --check src/startup_check.js && node --check src/stdio.js && node --check src/system_prompt.js && node --check src/timeouts.js && node --check src/tool_events.js && node --check src/tools.js && node --check src/ui.js && node --check src/usage.js && node --check src/version.js",
+    "test": "node --test tests/*.test.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",

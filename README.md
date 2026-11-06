@@ -2,23 +2,55 @@
 
 Mate opens the terminal UI by default. Launch `mate --workspace /path/to/project`
 (or `npm start`). `--ui terminal` is also accepted. The default workspace is the current directory.
-For server mode, use `mate --stdio --workspace /path/to/project` (or `npm run server`).
-Communication uses newline-delimited JSON-RPC 2.0 on stdin/stdout; diagnostics go
-to stderr. In server mode, no terminal UI or interactive prompts are started.
+For server mode, use `mate app-server --listen stdio:// --workspace /path/to/project`
+(or `npm run server`). `mate --stdio` remains supported. Communication uses
+newline-delimited JSON-RPC 2.0 on stdin/stdout; diagnostics go to stderr. No
+terminal UI or interactive terminal prompts are started.
 
-Client requests: `initialize`, `turn/start` with `{ "prompt": "..." }` (or an
+The Mate package owns its complete app-server harness: saved-session resume,
+tool permissions, command output, skills, usage accounting, and JSON event
+serialization. The host launches the Mate executable and forwards stdio; it does
+not import Mate source files or inject JavaScript adapters.
+
+Client requests are `initialize`, `turn/start` with `{ "prompt": "..." }` (or an
 `input` array of `{ "type": "text", "text": "..." }`), `turn/interrupt`,
-`conversation/reset`, and `shutdown` when no turn is active. Each request
-carries an `id` and receives a response with that same ID. Only one turn runs at
-a time. `turn/interrupt` is accepted while a turn is active; it aborts the active
-model request, emits `codex.interrupt`, and discards messages produced during the
-interrupted turn from Mate's conversation history.
+`conversation/reset`, `conversation/resume`, and `shutdown` when no turn is active.
+Each request carries an `id` and receives a response with that same ID. Only one
+turn runs at a time. Resume restores the latest saved conversation without a
+model request. Interrupt aborts the active request and discards partial history.
 
-Activity and Markdown messages retain the `codex.activity`, `codex.user.message`,
-and `codex.assistant.message` notifications. Approvals arrive as server requests
-named `mate/approval/request`; reply with `result: { "approved": true }` or false.
-Input requests use `mate/input/request`; reply with `result: { "value": "..." }`.
-These are Mate's methods, not a complete implementation of the Codex app-server protocol.
+The harness emits `turn/started`, `item/started`, `item/completed`, and
+`turn/completed` notifications. Assistant items have type `agentMessage` with
+`id`, `text`, and `phase`; a completed `turn/start` response contains
+`{ "markdown": "...", "turn": { "id": "...", "status": "completed", "items": [], "error": null } }`.
+Failed and interrupted turns carry their status and error rather than an invented
+answer. Model replies stay plain text; the harness builds the JSON envelopes.
+Tool calls use `item/started` and `item/completed`: commands are
+`commandExecution` items with output, exit code and duration; built-in tools are
+`dynamicToolCall` items with arguments and output; MCP calls are `mcpToolCall`
+items with server, tool, arguments, result and error. Command output uses
+`item/commandExecution/outputDelta` and reconciles with the completed snapshot.
+The harness retains the original model-facing tool result. Remaining progress
+notifications use `codex.activity`. Approvals arrive as `mate/approval/request`; reply with
+`result: { "approved": true }` or false. Input requests use `mate/input/request`;
+reply with `result: { "value": "..." }`. This supports the workspace's Codex-style
+event flow; it is not a complete implementation of every Codex app-server method.
+
+App-server permission policy is loaded from `$MATE_HOME/permissions.json` (default
+`~/.mate/permissions.json`), or the file named by `MATE_PERMISSIONS_FILE`. The
+`permissions` object supports `read`, `write`, `commands`, and `network`; the `mcp`
+object maps server names to `allow`, `ask`, or `deny`. Missing permissions require
+approval. Trusted host-owned `cmSetup` turns bypass approvals only for that turn;
+a web host must remove this parameter from untrusted browser requests.
+App-server mode disables automatic answer-assessment passes. It validates tool
+arguments and completion status before execution, with bounded recovery for
+malformed output.
+
+Set `AGENT_USAGE_FILE` to receive cumulative usage snapshots. The legacy
+`CM_AGENT_USAGE_FILE` variable is also accepted. Tool child processes receive the
+project environment without the host's private runtime paths. Run
+`mate --check-startup` to verify startup, skill discovery, and reset without an
+LLM request.
 
 Mate is a terminal coding companion for local projects. It talks to an
 OpenAI-compatible API, works inside a bounded workspace, and shows a friendly TUI
@@ -386,3 +418,9 @@ Good merge requests include:
 After review, accepted merge requests are merged into `main`. Maintainers use
 the merged state of `main` to build and publish release artifacts, so changes are
 included in releases only after they have been reviewed and merged.
+
+
+Command, Git, browsing, and plugin tools default to a 15-minute execution timeout
+and accept `max_time_seconds` up to 7200 (2 hours). MCP tool calls wait up to
+2 hours and retain cancellation support. Explicit shorter tool timeouts are
+respected. Persistent development servers should still use background processes.

@@ -1,3 +1,4 @@
+import { MAX_TOOL_TIMEOUT_SECONDS } from "./timeouts.js";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -60,12 +61,12 @@ export class McpRegistry {
     return this.toolMap.has(name);
   }
 
-  async callTool(name, args) {
+  async callTool(name, args, { signal } = {}) {
     const mapped = this.toolMap.get(name);
     if (!mapped) throw new Error(`unknown MCP tool: ${name}`);
     const entry = this.clients.get(mapped.serverName);
     if (!entry) throw new Error(`MCP server is not connected: ${mapped.serverName}`);
-    const result = await entry.client.callTool({ name: mapped.toolName, arguments: args });
+    const result = await entry.client.callTool({ name: mapped.toolName, arguments: args }, undefined, { timeout: MAX_TOOL_TIMEOUT_SECONDS * 1000, maxTotalTimeout: MAX_TOOL_TIMEOUT_SECONDS * 1000, signal });
     return formatMcpResult(result);
   }
 
