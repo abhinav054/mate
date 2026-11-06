@@ -142,16 +142,32 @@ export function startBackgroundProcess({ command, cwd = ".", process_id = null }
   const id = (process_id || `bg-${new Date().toISOString().replace(/\D/g, "")}`).trim();
   if (backgroundProcesses.has(id)) throw new Error(`background process already exists: ${id}`);
   if (looksLikeServerCommand(command)) recordWorkspaceServer({ command, cwd });
-  const child = spawn("bash", ["-lc", command], { cwd: workdir, stdio: ["pipe", "pipe", "pipe"], detached: true });
-  const entry = { command, cwd: workdir === activeWorkspace ? "." : relative(workdir), created_at: new Date().toISOString(), process: child, output: [] };
+  const logRoot = process.env.AGENT_TERMINAL_LOG_ROOT || process.env.CODEX_TERMINAL_LOG_ROOT || path.join(os.tmpdir(), "codex-terminals");
+  fs.mkdirSync(logRoot, { recursive: true, mode: 0o700 });
+  const logFile = path.join(fs.mkdtempSync(path.join(logRoot, "mate-background-")), "stdout.log");
+  const output = fs.openSync(logFile, "a", 0o600);
+  let child;
+  try {
+    // Real file descriptors let the workspace discover and follow both streams,
+    // even after descendants detach or their launching shell exits.
+    child = spawn("bash", ["-lc", command], { cwd: workdir, stdio: ["pipe", output, output], detached: true });
+  } finally { fs.closeSync(output); }
+  const entry = { command, cwd: workdir === activeWorkspace ? "." : relative(workdir), created_at: new Date().toISOString(), process: child, logFile };
   backgroundProcesses.set(id, entry);
-  const capture = (name) => (chunk) => {
-    for (const line of chunk.toString("utf8").split(/\r?\n/).filter(Boolean)) entry.output.push(`[${name}] ${line}`);
-    entry.output = entry.output.slice(-600);
-  };
-  child.stdout.on("data", capture("stdout"));
-  child.stderr.on("data", capture("stderr"));
-  return `started ${id} running pid=${child.pid}\nStartup output:\n${entry.output.slice(-40).join("\n") || "(no output captured during startup wait)"}\nTo read stdout/stderr later, call read_background_process with process_id=${id}.`;
+  return `started ${id} running pid=${child.pid}\nStartup output:\n${readBackgroundOutput(entry, 40) || "(no output captured during startup wait)"}\nTo read stdout/stderr later, call read_background_process with process_id=${id}.`;
+}
+
+function readBackgroundOutput(entry, maxLines) {
+  const file = fs.openSync(entry.logFile, "r");
+  try {
+    const size = fs.fstatSync(file).size;
+    const start = Math.max(0, size - 65536);
+    const buffer = Buffer.alloc(Math.min(size, 65536));
+    const bytes = fs.readSync(file, buffer, 0, buffer.length, start);
+    const lines = buffer.subarray(0, bytes).toString("utf8").trimEnd().split(/\r?\n/);
+    if (start > 0 && lines.length > 1) lines.shift();
+    return lines.slice(-maxLines).join("\n");
+  } finally { fs.closeSync(file); }
 }
 
 export function listBackgroundProcesses() {
@@ -163,7 +179,7 @@ export function listBackgroundProcesses() {
 export function readBackgroundProcess({ process_id, max_lines = 120 }) {
   const entry = backgroundProcesses.get(process_id);
   if (!entry) throw new Error(`background process not found: ${process_id}`);
-  return trimOutput(`${process_id} ${entry.process.exitCode === null ? "running" : `exited(${entry.process.exitCode})`} pid=${entry.process.pid}\n${entry.output.slice(-clamp(max_lines, 1, 600)).join("\n") || "(no output captured yet)"}`);
+  return trimOutput(`${process_id} ${entry.process.exitCode === null ? "running" : `exited(${entry.process.exitCode})`} pid=${entry.process.pid}\n${readBackgroundOutput(entry, clamp(max_lines, 1, 600)) || "(no output captured yet)"}`);
 }
 
 export function writeBackgroundProcess({ process_id, input_text }) {
