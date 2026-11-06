@@ -37,7 +37,10 @@ export async function executeCommand(command, args, options) {
   };
   try {
     const { timeout, input, ...spawnOptions } = options;
-    child = spawn(command, args, { ...spawnOptions, detached: true, stdio: ['pipe', descriptor, descriptor] });
+    // Runner images wrap bash in `script`, whose PTY can hang up background
+    // descendants on shell exit. We already capture output in a real file.
+    const executable = command === 'bash' && fs.existsSync('/opt/codex-real/bash') ? '/opt/codex-real/bash' : command;
+    child = spawn(executable, args, { ...spawnOptions, detached: true, stdio: ['pipe', descriptor, descriptor] });
     child.stdin.on('error', () => {}); // A command may exit without consuming input.
     child.stdin.end(input);
     return await new Promise(resolve => {
