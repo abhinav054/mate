@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { commandOutcome } from './command_output.js';
 import { withCommandExecution } from './command_execution.js';
 
-const commands = new Set(['run_command', 'git', 'run_plugin_hook', 'start_background_process', 'read_background_process', 'write_background_process', 'stop_background_process', 'list_background_processes']);
+const commands = new Set(['run_command', 'git', 'run_plugin_hook', 'start_background_process', 'read_background_process', 'monitor_background_process', 'write_background_process', 'stop_background_process', 'list_background_processes']);
 const limit = 32768;
 const bounded = text => text.length > limit ? text.slice(0, limit) + '\n[Output truncated]' : text;
 
@@ -48,8 +48,9 @@ export function installToolEvents(agent, publish, turn = () => null) {
     const output = bounded([content, ...state.diffs].filter(Boolean).join('\n\n'));
     item = { ...item, status: failed ? 'failed' : 'completed', durationMs: Date.now() - started };
     if (item.type === 'commandExecution') {
-      item.status = declined ? 'declined' : outcome.status === 'timedOut' ? 'timedOut' : outcome.status === 'interrupted' || agent.currentTurn?.interrupted ? 'interrupted' : item.status;
+      item.status = declined ? 'declined' : ['timedOut', 'backgrounded', 'inProgress'].includes(outcome.status) ? outcome.status : outcome.status === 'interrupted' || agent.currentTurn?.interrupted ? 'interrupted' : item.status;
       item.exitCode = outcome.exitCode ?? null;
+      item.processId = outcome.processId ?? item.processId;
       item.aggregatedOutput = output;
       if (output && !streamed) publish('item/commandExecution/outputDelta', { ...(current ? { turnId: current.id } : {}), itemId: item.id, delta: output });
     } else if (item.type === 'mcpToolCall') {

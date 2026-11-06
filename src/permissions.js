@@ -1,4 +1,4 @@
-const readTools = new Set(["read_file", "list_files", "glob_files", "search_files", "check_system_tools", "read_background_process", "list_background_processes", "list_agent_resources", "read_agent_resource", "load_command", "load_skill", "load_agent_prompt"]);
+const readTools = new Set(["read_file", "list_files", "glob_files", "search_files", "check_system_tools", "read_background_process", "monitor_background_process", "list_background_processes", "list_agent_resources", "read_agent_resource", "load_command", "load_skill", "load_agent_prompt"]);
 const writeTools = new Set(["touch_file", "write_file", "edit_file", "record_workspace_server", "update_todos"]);
 const commandTools = new Set(["run_command", "start_background_process", "write_background_process", "stop_background_process", "git", "run_plugin_hook"]);
 

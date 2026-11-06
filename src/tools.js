@@ -3,8 +3,9 @@ import os from "node:os";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { randomUUID } from "node:crypto";
 import { DEFAULT_TOOL_TIMEOUT_SECONDS, MAX_TOOL_TIMEOUT_SECONDS, toolTimeoutSeconds } from "./timeouts.js";
-import { executeCommand } from "./command_execution.js";
+import { executeCommand, trackProcess, commandExecutionSignal, backgroundCompletionHandler } from "./command_execution.js";
 
 const MAX_TOOL_OUTPUT_CHARS = 16000;
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -119,26 +120,40 @@ export function editFile({ path: filePath, old_text, new_text, replace_all = fal
   return `edited ${relative(target)}; replacements=${replace_all ? count : 1}`;
 }
 
-export async function runCommand({ command, cwd = ".", max_time_seconds = DEFAULT_TOOL_TIMEOUT_SECONDS }) {
+export async function runCommand({ command, cwd = ".", max_time_seconds = DEFAULT_TOOL_TIMEOUT_SECONDS, yield_after_seconds = 60 }) {
   const workdir = checkedWorkdir(cwd);
   let recorded = "";
   if (looksLikeServerCommand(command)) recorded = recordWorkspaceServer({ command, cwd });
-  const result = await executeCommand("bash", ["-lc", command], { cwd: workdir, timeout: toolTimeoutSeconds(max_time_seconds) * 1000 });
+  const result = await executeCommand("bash", ["-lc", command], { cwd: workdir, timeout: toolTimeoutSeconds(max_time_seconds) * 1000, yieldAfterMs: foregroundWindow(yield_after_seconds) });
   let output = commandResult(result, "command", max_time_seconds);
   if (recorded) output += `\n[workspace_server_recorded=${WORKSPACE_SERVERS_FILE}]`;
   return output;
 }
 
-export async function git({ command, cwd = ".", max_time_seconds = DEFAULT_TOOL_TIMEOUT_SECONDS }) {
+export async function git({ command, cwd = ".", max_time_seconds = DEFAULT_TOOL_TIMEOUT_SECONDS, yield_after_seconds = 60 }) {
   if (!which("git")) throw new Error("git is not installed");
-  const result = await executeCommand("git", gitArgs(command), { cwd: checkedWorkdir(cwd), timeout: toolTimeoutSeconds(max_time_seconds) * 1000 });
+  const result = await executeCommand("git", gitArgs(command), { cwd: checkedWorkdir(cwd), timeout: toolTimeoutSeconds(max_time_seconds) * 1000, yieldAfterMs: foregroundWindow(yield_after_seconds) });
   return commandResult(result, "git", max_time_seconds);
 }
 
 function commandResult(result, label, seconds) {
   if (result.error) throw result.error;
+  if (result.backgrounded) {
+    const id = `bg-${randomUUID()}`;
+    registerBackgroundProcess(id, result.entry);
+    return `${id} running pid=${result.entry.process.pid}\nCommand continues in the background; do not restart it. Execution deadline: ${result.entry.timeoutSeconds} seconds from launch.\n${backgroundGuidance(id)}\nCaptured output so far (not a completed result):\n${trimOutput(result.output) || '(no output captured yet)'}\n[background_process_id=${id}]`;
+  }
   const suffix = result.interrupted ? '[interrupted]' : result.timedOut ? `[timeout_seconds=${toolTimeoutSeconds(seconds)}]` : `[exit_code=${result.status ?? 1}]`;
   return result.output ? `${trimOutput(result.output)}\n\n${suffix}` : result.interrupted || result.timedOut ? suffix : `(${label} exited ${result.status ?? 1} with no output)`;
+}
+
+function backgroundGuidance(id) {
+  return `The process is still running. If the next step depends on its result, output, or generated files, WAIT before that step: call monitor_background_process with ${JSON.stringify({ process_id: id, wait_seconds: 30 })}. Repeat while status is running, then inspect the final exit status and output before continuing. A monitor wait expiring is not process completion.\nFor logs, call read_background_process with ${JSON.stringify({ process_id: id })}; partial output alone does not prove completion. Independent work may continue. For a persistent server, verify readiness instead of waiting for it to exit. Completion will also be reported automatically.`;
+}
+
+function foregroundWindow(seconds) {
+  if (!Number.isSafeInteger(seconds) || seconds < 1 || seconds > 60) throw new Error('yield_after_seconds must be an integer between 1 and 60');
+  return seconds * 1000;
 }
 
 export function startBackgroundProcess({ command, cwd = ".", process_id = null }) {
@@ -152,11 +167,12 @@ export function startBackgroundProcess({ command, cwd = ".", process_id = null }
   try {
     // Real file descriptors let the workspace discover and follow both streams,
     // even after descendants detach or their launching shell exits.
-    child = spawn("bash", ["-lc", command], { cwd: workdir, stdio: ["pipe", output, output], detached: true });
+    child = spawn(fs.existsSync('/opt/codex-real/bash') ? '/opt/codex-real/bash' : 'bash', ["-lc", command], { cwd: workdir, stdio: ["pipe", output, output], detached: true });
   } finally { fs.closeSync(output); }
-  const entry = { command, cwd: workdir === activeWorkspace ? "." : relative(workdir), created_at: new Date().toISOString(), process: child, logFile };
-  backgroundProcesses.set(id, entry);
-  return `started ${id} running pid=${child.pid}\nStartup output:\n${readBackgroundOutput(entry, 40) || "(no output captured during startup wait)"}\nTo read stdout/stderr later, call read_background_process with process_id=${id}.`;
+  const entry = trackProcess(child, { command, cwd: workdir === activeWorkspace ? "." : relative(workdir), created_at: new Date().toISOString(), logFile });
+  child.stdin.on('error', () => {});
+  registerBackgroundProcess(id, entry);
+  return `started ${id} running pid=${child.pid}\n${backgroundGuidance(id)}\nStartup output:\n${readBackgroundOutput(entry, 40) || "(no output captured during startup wait)"}`;
 }
 
 function createProcessLog(prefix) {
@@ -180,20 +196,72 @@ function readBackgroundOutput(entry, maxLines) {
 
 export function listBackgroundProcesses() {
   const rows = [];
-  for (const [id, entry] of backgroundProcesses) rows.push(`${id}\t${entry.process.exitCode === null ? "running" : `exited(${entry.process.exitCode})`}\tpid=${entry.process.pid}\tcwd=${entry.cwd}\t${entry.command}`);
+  for (const [id, entry] of backgroundProcesses) rows.push(`${id}\t${backgroundStatus(entry)}\tpid=${entry.process.pid}\tcwd=${entry.cwd}\t${entry.command}`);
   return rows.join("\n") || "(empty)";
 }
 
 export function readBackgroundProcess({ process_id, max_lines = 120 }) {
   const entry = backgroundProcesses.get(process_id);
   if (!entry) throw new Error(`background process not found: ${process_id}`);
-  return trimOutput(`${process_id} ${entry.process.exitCode === null ? "running" : `exited(${entry.process.exitCode})`} pid=${entry.process.pid}\n${readBackgroundOutput(entry, clamp(max_lines, 1, 600)) || "(no output captured yet)"}`);
+  const status = `${process_id} ${backgroundStatus(entry)} pid=${entry.process.pid}`;
+  const output = trimOutput(readBackgroundOutput(entry, clamp(max_lines, 1, 600)) || "(no output captured yet)");
+  const error = entry.result?.error ? `\nERROR: ${entry.result.error.message}` : '';
+  const timeout = entry.result?.timedOut ? `\n[timeout_seconds=${entry.timeoutSeconds}]` : '';
+  return `${status}\n${output}${error}${timeout}`;
+}
+
+function backgroundStatus(entry) {
+  if (!entry.result) return 'running';
+  if (entry.result.timedOut) return 'timedOut';
+  if (entry.result.error) return 'failed';
+  if (entry.result.exitSignal) return `signaled(${entry.result.exitSignal})`;
+  return `exited(${entry.result.status})`;
+}
+
+function registerBackgroundProcess(id, entry) {
+  backgroundProcesses.set(id, entry);
+  const notify = backgroundCompletionHandler();
+  if (!notify) return;
+  entry.completion.then(() => {
+    let output;
+    try { output = trimOutput(readBackgroundOutput(entry, 120)); }
+    catch (error) { output = `(log unavailable: ${error.message})`; }
+    notify({ processId: id, pid: entry.process.pid, command: entry.command, cwd: entry.cwd,
+      status: entry.result.timedOut ? 'timedOut' : entry.result.error || entry.result.exitSignal || entry.result.status !== 0 ? 'failed' : 'completed',
+      exitCode: entry.result.status ?? null, signal: entry.result.exitSignal ?? null,
+      error: entry.result.error?.message ?? null, durationMs: Date.now() - Date.parse(entry.created_at),
+      timeoutSeconds: entry.timeoutSeconds ?? null, logFile: entry.logFile, output });
+  }).catch(error => process.stderr.write(`Background completion notification failed: ${error.message}\n`));
+}
+
+export async function monitorBackgroundProcess({ process_id, wait_seconds = 10, max_lines = 120 }) {
+  const entry = backgroundProcesses.get(process_id);
+  if (!entry) throw new Error(`background process not found: ${process_id}`);
+  if (!Number.isSafeInteger(wait_seconds) || wait_seconds < 0 || wait_seconds > 30) throw new Error('wait_seconds must be an integer between 0 and 30');
+  const signal = commandExecutionSignal();
+  if (signal?.aborted) throw signal.reason || new Error('Monitor interrupted');
+  if (!entry.result && wait_seconds > 0) {
+    let timer, abort;
+    try {
+      await Promise.race([entry.completion, new Promise((resolve, reject) => {
+        timer = setTimeout(resolve, wait_seconds * 1000);
+        abort = () => reject(signal.reason || new Error('Monitor interrupted'));
+        signal?.addEventListener('abort', abort, { once: true });
+        if (signal?.aborted) abort();
+      })]);
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', abort);
+    }
+  }
+  return readBackgroundProcess({ process_id, max_lines });
 }
 
 export function writeBackgroundProcess({ process_id, input_text }) {
   const entry = backgroundProcesses.get(process_id);
   if (!entry) throw new Error(`background process not found: ${process_id}`);
-  if (entry.process.exitCode !== null) return `${process_id} already exited with code ${entry.process.exitCode}`;
+  if (entry.result) return `${process_id} already ${backgroundStatus(entry)}`;
+  if (!entry.process.stdin.writable) throw new Error('Process stdin is closed; auto-backgrounded commands do not accept input');
   entry.process.stdin.write(input_text);
   return `wrote ${input_text.length} chars to ${process_id}`;
 }
@@ -201,6 +269,7 @@ export function writeBackgroundProcess({ process_id, input_text }) {
 export function stopBackgroundProcess({ process_id, signal_name = "TERM" }) {
   const entry = backgroundProcesses.get(process_id);
   if (!entry) throw new Error(`background process not found: ${process_id}`);
+  if (entry.result) return `${process_id} already ${backgroundStatus(entry)}`;
   const signal = `SIG${signal_name.toUpperCase().replace(/^SIG/, "")}`;
   if (!["SIGTERM", "SIGINT", "SIGKILL"].includes(signal)) throw new Error("signal_name must be TERM, INT, or KILL");
   try { process.kill(-entry.process.pid, signal); } catch { entry.process.kill(signal); }
@@ -306,18 +375,18 @@ export function updateTodos({ items_json }) {
   return todos.map((item) => `- [${item.status}] ${item.content}`).join("\n") || "(empty)";
 }
 
-export async function runPluginHook({ plugin_name, hook_command, input_json = "{}", max_time_seconds = DEFAULT_TOOL_TIMEOUT_SECONDS }) {
+export async function runPluginHook({ plugin_name, hook_command, input_json = "{}", max_time_seconds = DEFAULT_TOOL_TIMEOUT_SECONDS, yield_after_seconds = 60 }) {
   const pluginRoot = resolveInResources(`mate-plugins/${plugin_name}`);
   const env = { ...process.env, MATE_PLUGIN_ROOT: pluginRoot };
-  const result = await executeCommand("bash", ["-lc", hook_command], { cwd: activeWorkspace, input: input_json, timeout: toolTimeoutSeconds(max_time_seconds) * 1000, env });
+  const result = await executeCommand("bash", ["-lc", hook_command], { cwd: activeWorkspace, input: input_json, timeout: toolTimeoutSeconds(max_time_seconds) * 1000, yieldAfterMs: foregroundWindow(yield_after_seconds), env });
   return commandResult(result, "hook", max_time_seconds);
 }
 
 export const TOOLS = {
-  browse_internet: browseInternet, check_system_tools: checkSystemTools, list_files: listFiles, glob_files: globFiles, git, read_file: readFile, touch_file: touchFile, write_file: writeFile, edit_file: editFile, record_workspace_server: recordWorkspaceServer, run_command: runCommand, start_background_process: startBackgroundProcess, list_background_processes: listBackgroundProcesses, read_background_process: readBackgroundProcess, write_background_process: writeBackgroundProcess, stop_background_process: stopBackgroundProcess, request_user_input: requestUserInput, search_files: searchFiles, list_agent_resources: listAgentResources, read_agent_resource: readAgentResource, load_command: loadCommand, load_skill: loadSkill, load_agent_prompt: loadAgentPrompt, update_todos: updateTodos, run_plugin_hook: runPluginHook
+  browse_internet: browseInternet, check_system_tools: checkSystemTools, list_files: listFiles, glob_files: globFiles, git, read_file: readFile, touch_file: touchFile, write_file: writeFile, edit_file: editFile, record_workspace_server: recordWorkspaceServer, run_command: runCommand, start_background_process: startBackgroundProcess, list_background_processes: listBackgroundProcesses, read_background_process: readBackgroundProcess, monitor_background_process: monitorBackgroundProcess, write_background_process: writeBackgroundProcess, stop_background_process: stopBackgroundProcess, request_user_input: requestUserInput, search_files: searchFiles, list_agent_resources: listAgentResources, read_agent_resource: readAgentResource, load_command: loadCommand, load_skill: loadSkill, load_agent_prompt: loadAgentPrompt, update_todos: updateTodos, run_plugin_hook: runPluginHook
 };
 
-export const TOOL_DEFINITIONS = Object.keys(TOOLS).map((name) => ({ type: "function", function: { name, description: `Run Mate tool ${name}.`, parameters: toolSchema(name) } }));
+export const TOOL_DEFINITIONS = Object.keys(TOOLS).map((name) => ({ type: "function", function: { name, description: name === "monitor_background_process" ? "Monitor a tracked process for completion with a bounded wait. Return running or final exit status and recent stdout/stderr; call again if still running. Never restarts or kills the process." : `Run Mate tool ${name}.`, parameters: toolSchema(name) } }));
 
 function toolSchema(name) {
   const common = { type: "object", properties: {} };
@@ -325,14 +394,15 @@ function toolSchema(name) {
     browse_internet: { url: "string", max_time_seconds: "integer" },
     list_files: { path: "string" },
     glob_files: { pattern: "string", path: "string" },
-    git: { command: "string", cwd: "string", max_time_seconds: "integer" },
+    git: { command: "string", cwd: "string", max_time_seconds: "integer", yield_after_seconds: "integer" },
     read_file: { path: "string", max_lines: "integer" },
     touch_file: { path: "string" },
     write_file: { path: "string", content: "string", append: "boolean" },
     edit_file: { path: "string", old_text: "string", new_text: "string", replace_all: "boolean" },
-    run_command: { command: "string", cwd: "string", max_time_seconds: "integer" },
+    run_command: { command: "string", cwd: "string", max_time_seconds: "integer", yield_after_seconds: "integer" },
     start_background_process: { command: "string", cwd: "string", process_id: "string" },
     read_background_process: { process_id: "string", max_lines: "integer" },
+    monitor_background_process: { process_id: "string", wait_seconds: "integer", max_lines: "integer" },
     write_background_process: { process_id: "string", input_text: "string" },
     stop_background_process: { process_id: "string", signal_name: "string" },
     request_user_input: { prompt: "string", secret: "boolean", default: "string" },
@@ -343,13 +413,13 @@ function toolSchema(name) {
     load_skill: { skill_name: "string" },
     load_agent_prompt: { agent_name: "string" },
     update_todos: { items_json: "string" },
-    run_plugin_hook: { plugin_name: "string", hook_command: "string", input_json: "string", max_time_seconds: "integer" },
+    run_plugin_hook: { plugin_name: "string", hook_command: "string", input_json: "string", max_time_seconds: "integer", yield_after_seconds: "integer" },
     record_workspace_server: { command: "string", cwd: "string", reason: "string" }
   };
   const spec = schemas[name] || {};
   return { ...common, properties: Object.fromEntries(Object.entries(spec).map(([key, type]) => [key,
     key === "max_time_seconds" ? { type, minimum: 1, maximum: MAX_TOOL_TIMEOUT_SECONDS, default: DEFAULT_TOOL_TIMEOUT_SECONDS,
-      description: "Optional execution timeout in seconds. Omit to allow 15 minutes; request up to 2 hours for longer work." } : name === "read_file" && key === "max_lines" ? { type, minimum: 1, maximum: 10000, description: "Optional maximum number of lines to read from the start of the file." } : { type }
+      description: "Optional execution timeout in seconds. Omit to allow 15 minutes; request up to 2 hours for longer work." } : key === "yield_after_seconds" ? { type, minimum: 1, maximum: 60, default: 60, description: "Foreground wait before a still-running command automatically continues in the background. Retain its process_id; read output or monitor completion without restarting it." } : key === "wait_seconds" ? { type, minimum: 0, maximum: 30, default: 10, description: "Wait up to this many seconds for process completion, then return current status and output. Does not stop a still-running process." } : name === "read_file" && key === "max_lines" ? { type, minimum: 1, maximum: 10000, description: "Optional maximum number of lines to read from the start of the file." } : { type }
   ])) };
 }
 

@@ -433,6 +433,28 @@ and accept `max_time_seconds` up to 7200 (2 hours). MCP tool calls wait up to
 2 hours and retain cancellation support. Explicit shorter tool timeouts are
 respected. Persistent development servers should still use background processes.
 Command, Git, and plugin-hook output streams to the workspace while the tool is
-running. Interrupts stop the command process group; timeouts appear as "Timed out"
-and preserve the captured output. Streaming does not turn a foreground server
-into a background process.
+running. Commands, Git, and plugin hooks that exceed the 60-second foreground
+window automatically continue in the background without restarting. Set
+`yield_after_seconds` (1–60) to adjust that window. The returned
+`background_process_id` identifies the job; backgrounding is not exit success.
+The original `max_time_seconds` execution deadline still applies after handoff.
+
+Use `read_background_process` with `process_id` to inspect recent stdout/stderr,
+or `monitor_background_process` with `process_id`, `wait_seconds` (0–30, default
+10), and optional `max_lines` to wait for completion and read output. A monitor
+wait expiring returns "running" and leaves the job alone; a process deadline
+expiring returns "timedOut". Completed jobs retain their exit code and logs.
+Monitoring uses process exit events and does not launch another process.
+
+Before handoff, interrupting the command stops its process group. After handoff,
+interrupting a monitor only cancels the wait; use `stop_background_process` to
+stop the job. Auto-backgrounded commands have closed stdin; use an explicit
+`start_background_process` when interactive input is needed. Persistent servers
+should use that explicit tool, which has no automatic execution deadline.
+
+Background completion events include the process ID, command, cwd, PID, status,
+exit code or signal, duration, log path, and bounded recent output. The agent
+receives them before its next model request. In app-server mode, completion
+starts a follow-up turn if the agent is idle; active turns consume the event
+without overlapping another turn. Interrupting pauses automatic follow-ups
+until the next user turn.

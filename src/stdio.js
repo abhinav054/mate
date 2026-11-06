@@ -31,6 +31,22 @@ export async function runStdioServer({ workspace, input = process.stdin, output 
   let activeTurnRequestId = null;
   let currentTurn = null;
   let toolEvents = null;
+  let backgroundWakePaused = false, backgroundWakeScheduled = false;
+  const launchTask = task => {
+    handlers.add(task);
+    void task.finally(() => handlers.delete(task));
+  };
+  const scheduleBackgroundTurn = () => {
+    if (backgroundWakeScheduled || closed || backgroundWakePaused) return;
+    backgroundWakeScheduled = true;
+    queueMicrotask(() => {
+      backgroundWakeScheduled = false;
+      if (closed || active || backgroundWakePaused || !agent?.hasPendingProcessCompletions?.()) return;
+      launchTask(handle(JSON.stringify({ jsonrpc: '2.0', method: 'turn/start', params: {
+        prompt: 'A tracked background process finished. Review its completion event and output, continue any dependent work from the existing task, and report the outcome. Do not restart completed commands or invent a new task.'
+      } }), true).catch(error => process.stderr.write(`${error.message}\n`)));
+    });
+  };
   const assistantMessage = (text, phase = "commentary") => {
     const item = { id: `mate-message-${randomUUID()}`, type: "agentMessage", text: String(text ?? ""), phase };
     const params = { ...(currentTurn ? { turnId: currentTurn.id } : {}), item };
@@ -46,6 +62,10 @@ export async function runStdioServer({ workspace, input = process.stdin, output 
     send({ id, method, params });
   });
   const ui = {
+    backgroundComplete: event => {
+      notify('mate/backgroundProcess/completed', event);
+      scheduleBackgroundTurn();
+    },
     banner() {},
     message: (markdown) => assistantMessage(markdown),
     panel: (title, detail) => notify("codex.activity", { type: "reasoning", title, detail }),
@@ -61,7 +81,7 @@ export async function runStdioServer({ workspace, input = process.stdin, output 
     formatDuration: (ms) => `${(ms / 1000).toFixed(1)}s`
   };
   const lines = readline.createInterface({ input, crlfDelay: Infinity, terminal: false });
-  async function handle(line) {
+  async function handle(line, backgroundTurn = false) {
     let message;
     try { message = JSON.parse(line); }
     catch { send({ id: null, error: { code: -32700, message: "Parse error" } }); return; }
@@ -88,6 +108,7 @@ export async function runStdioServer({ workspace, input = process.stdin, output 
     if (message.method === "turn/interrupt") {
       if (!active || !agent) { fail(-32000, "No turn is running"); return; }
       const reason = String(message.params?.reason || "client requested interrupt");
+      backgroundWakePaused = true;
       const interrupted = agent.interruptCurrentTurn(reason);
       if (interrupted) notify("codex.interrupt", { reason, request_id: activeTurnRequestId });
       respond({ interrupted });
@@ -95,6 +116,7 @@ export async function runStdioServer({ workspace, input = process.stdin, output 
     }
     if (!["turn/start", "conversation/reset", "conversation/resume"].includes(message.method)) { fail(-32601, "Method not found"); return; }
     if (active) { fail(-32000, "A turn is running"); return; }
+    if (message.method === 'turn/start' && !backgroundTurn) backgroundWakePaused = false;
     const params = message.params || {};
     const prompt = params.prompt ?? (Array.isArray(params.input) ? params.input.filter((item) => item.type === "text").map((item) => item.text).join("\n") : undefined);
     if (message.method === "turn/start" && (typeof prompt !== "string" || !prompt.trim())) { fail(-32602, "A nonempty prompt or text input is required"); return; }
@@ -119,7 +141,7 @@ export async function runStdioServer({ workspace, input = process.stdin, output 
         respond({ resumed: true }); return;
       }
       if (message.method === "conversation/reset") { agent.reset(); respond(null); return; }
-      notify("codex.user.message", { markdown: prompt });
+      if (!backgroundTurn) notify("codex.user.message", { markdown: prompt });
       const started = Date.now();
       setup = params.cmSetup === true;
       currentTurn = { id: `mate-turn-${randomUUID()}`, status: "inProgress", items: [], error: null };
@@ -139,13 +161,15 @@ export async function runStdioServer({ workspace, input = process.stdin, output 
       if (error instanceof TurnInterruptedError) fail(-32800, error.message);
       else fail(-32603, error.message);
     }
-    finally { currentTurn = null; setup = false; active = false; activeTurnRequestId = null; }
+    finally {
+      currentTurn = null; setup = false; active = false; activeTurnRequestId = null;
+      scheduleBackgroundTurn();
+    }
   }
   lines.on("line", (line) => {
     if (closed) return;
     const task = handle(line).catch((error) => process.stderr.write(`${error.message}\n`));
-    handlers.add(task);
-    void task.finally(() => handlers.delete(task));
+    launchTask(task);
   });
   await new Promise((resolve) => lines.once("close", resolve));
   closed = true;

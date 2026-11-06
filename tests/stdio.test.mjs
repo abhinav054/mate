@@ -209,3 +209,82 @@ test('planning progress reaches app-server clients before the final answer', asy
     await server;
   } finally { input.end(); rmSync(workspace, { recursive: true, force: true }); }
 });
+
+test('background completions join active turns and wake idle agents without overlapping turns or faking user messages', async () => {
+  const { AgentServer } = await import('../src/server.js');
+  const input = new PassThrough(), output = new PassThrough(), events = [];
+  let buffer = '', agent, requests = 0, release;
+  const gate = new Promise(resolve => { release = resolve; });
+  output.on('data', chunk => {
+    buffer += chunk.toString();
+    const lines = buffer.split('\n'); buffer = lines.pop();
+    events.push(...lines.map(JSON.parse));
+  });
+  const waitUntil = async predicate => {
+    const deadline = Date.now() + 3000;
+    while (!predicate() && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
+    assert.ok(predicate(), JSON.stringify(events));
+  };
+  const server = runStdioServer({ workspace: tmpdir(), input, output, createAgent: async (_workspace, ui) => {
+    agent = new AgentServer({ client: { chat: { completions: { create: async ({ messages }) => {
+      requests++;
+      if (requests === 1) await gate;
+      if (requests > 1) assert.ok(messages.some(m => m.content?.includes(requests === 2 ? 'active output' : 'idle output')));
+      return { choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: requests === 1 ? 'stale' : 'Completion reviewed' } }] };
+    } } } }, model: 'test', ui, messages: [], mateConfig: { raw: {} } });
+    agent.compactContextIfNeeded = async () => {};
+    agent.saveNewMessages = () => {};
+    return agent;
+  }});
+  try {
+    const first = rpc(input, output, 1, 'turn/start', { prompt: 'Check the process' });
+    await waitUntil(() => requests === 1);
+    agent.queueProcessCompletion({ processId: 'active', status: 'completed', output: 'active output' });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.equal(requests, 1, 'completion must not start an overlapping model request');
+    release();
+    assert.equal((await first).result.markdown, 'Completion reviewed');
+    agent.queueProcessCompletion({ processId: 'idle', status: 'failed', exitCode: 7, output: 'idle output' });
+    await waitUntil(() => events.filter(e => e.method === 'turn/completed').length === 2);
+    assert.equal(requests, 3);
+    assert.equal(events.filter(e => e.method === 'mate/backgroundProcess/completed').length, 2);
+    assert.equal(events.filter(e => e.method === 'codex.user.message').length, 1);
+    assert.equal(events.filter(e => e.method === 'turn/started').length, 2);
+    await rpc(input, output, 2, 'shutdown');
+    await server;
+  } finally { release(); input.end(); }
+});
+
+test('interrupting a turn pauses background follow-ups until a user starts another turn', async () => {
+  const { AgentServer } = await import('../src/server.js');
+  const input = new PassThrough(), output = new PassThrough();
+  let agent, requests = 0;
+  const server = runStdioServer({ workspace: tmpdir(), input, output, createAgent: async (_workspace, ui) => {
+    agent = new AgentServer({ client: { chat: { completions: { create: async ({ messages }, options) => {
+      if (++requests === 1) await new Promise((resolve, reject) => options.signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true }));
+      assert.ok(messages.some(m => m.content?.includes('result retained')));
+      return { choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: 'Result reviewed after resume' } }] };
+    } } } }, model: 'test', ui, messages: [], mateConfig: { raw: {} } });
+    agent.compactContextIfNeeded = async () => {};
+    agent.saveNewMessages = () => {};
+    return agent;
+  }});
+  try {
+    const running = rpc(input, output, 1, 'turn/start', { prompt: 'Check the job' });
+    const deadline = Date.now() + 3000;
+    while (requests === 0 && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
+    assert.equal(requests, 1);
+    agent.queueProcessCompletion({ processId: 'retained', status: 'completed', output: 'result retained' });
+    const interrupted = await rpc(input, output, 2, 'turn/interrupt');
+    assert.equal(interrupted.result.interrupted, true);
+    assert.equal((await running).error.code, -32800);
+    await new Promise(resolve => setTimeout(resolve, 50));
+    assert.equal(requests, 1, 'background completion must not undo an explicit user interrupt');
+    assert.equal(agent.hasPendingProcessCompletions(), true);
+    const resumed = await rpc(input, output, 3, 'turn/start', { prompt: 'Continue' });
+    assert.equal(resumed.result.markdown, 'Result reviewed after resume');
+    assert.equal(requests, 2);
+    await rpc(input, output, 4, 'shutdown');
+    await server;
+  } finally { input.end(); }
+});
