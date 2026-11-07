@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { setWorkspace, runCommand, startBackgroundProcess, readBackgroundProcess, stopBackgroundProcess } from '../src/tools.js';
+import { setWorkspace, runCommand, startBackgroundProcess, readBackgroundProcess, stopBackgroundProcess, monitorBackgroundProcess } from '../src/tools.js';
 
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
 test('regular shell commands keep background descendants output discoverable', async () => {
@@ -68,5 +68,52 @@ test('background stdout and stderr use a discoverable file and remain readable t
     if (previous === undefined) delete process.env.AGENT_TERMINAL_LOG_ROOT; else process.env.AGENT_TERMINAL_LOG_ROOT = previous;
     setWorkspace(process.cwd());
     fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('background snapshots and completion preserve newlines, blank lines, spaces and CRLF', async () => {
+  const {withCommandExecution}=await import('../src/command_execution.js');
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),'mate-log-newlines-'));
+  const previous=process.env.AGENT_TERMINAL_LOG_ROOT;
+  process.env.AGENT_TERMINAL_LOG_ROOT=path.join(root,'logs');
+  setWorkspace(root);
+  const id='newline-preservation';
+  const events=[];
+  try {
+    withCommandExecution({onBackgroundComplete:event=>events.push(event)},()=>startBackgroundProcess({
+      process_id:id,command:"printf 'first\\n\\nsecond  \\r\\n\\n'"
+    }));
+    const result=await monitorBackgroundProcess({process_id:id,wait_seconds:2});
+    const expected='first\n\nsecond  \r\n\n';
+    assert.equal(result.slice(result.indexOf('\n')+1),expected);
+    assert.equal(readBackgroundProcess({process_id:id,max_lines:2}).split('\n').slice(1).join('\n'),'second  \r\n\n');
+    await pause(0);
+    assert.equal(events[0].output,expected);
+    assert.equal(fs.readFileSync(events[0].logFile,'utf8'),expected);
+  } finally {
+    try {stopBackgroundProcess({process_id:id,signal_name:'KILL'});} catch {}
+    if(previous===undefined)delete process.env.AGENT_TERMINAL_LOG_ROOT;else process.env.AGENT_TERMINAL_LOG_ROOT=previous;
+    setWorkspace(process.cwd());
+    fs.rmSync(root,{recursive:true,force:true});
+  }
+});
+
+test('newline-only background output remains log data', async ()=>{
+  const id='newline-only';
+  startBackgroundProcess({process_id:id,command:"printf '\\n\\n'"});
+  const result=await monitorBackgroundProcess({process_id:id,wait_seconds:2});
+  assert.equal(result.slice(result.indexOf('\n')+1),'\n\n');
+});
+
+test('foreground-to-background handoff preserves trailing line breaks', async ()=>{
+  const {executeCommand}=await import('../src/command_execution.js');
+  const result=await executeCommand('bash',['-lc',"printf 'ready\\n\\n'; sleep 0.3"],{
+    cwd:process.cwd(),timeout:2000,yieldAfterMs:100
+  });
+  try {
+    assert.equal(result.backgrounded,true);
+    assert.equal(result.output,'ready\n\n');
+  } finally {
+    await result.entry.completion;
   }
 });

@@ -23,6 +23,103 @@ function jsonArguments(value) {
   return parsed;
 }
 
+function numericEndingCanRecover(call, parsed, value) {
+  const envelope = parsed.function || parsed;
+  const wrapped = typeof envelope.name === "string" && Object.hasOwn(envelope, "arguments");
+  const name = wrapped ? envelope.name : call.function?.name;
+  if (wrapped && call.function?.name && name !== call.function.name) return false;
+  const args = wrapped ? envelope.arguments : parsed;
+  if (!args || typeof args !== "object" || Array.isArray(args)) return false;
+  if (name === "read_file") {
+    return /"max_lines"\s*:\s*[1-9]\d*\s*$/.test(value)
+      && typeof args.path === "string" && Number.isSafeInteger(args.max_lines)
+      && args.max_lines >= 1 && args.max_lines <= 10000
+      && Object.keys(args).every(key => ["path", "max_lines"].includes(key));
+  }
+  if (name !== "monitor_background_process") return false;
+  return /"(?:wait_seconds|max_lines)"\s*:\s*\d+\s*$/.test(value)
+    && typeof args.process_id === "string" && args.process_id.trim().length > 0
+    && Object.keys(args).every(key => ["process_id", "wait_seconds", "max_lines"].includes(key))
+    && (args.wait_seconds === undefined || (Number.isSafeInteger(args.wait_seconds) && args.wait_seconds >= 0 && args.wait_seconds <= 30))
+    && (args.max_lines === undefined || (Number.isSafeInteger(args.max_lines) && args.max_lines >= 1 && args.max_lines <= 600));
+}
+
+function dropIncompleteOptionalArgument(call, definitions) {
+  const raw = call.function?.arguments;
+  const schema = definitions.find(tool => tool.function.name === call.function?.name)?.function.parameters;
+  if (typeof raw !== "string" || !schema || schema.type !== "object") return call;
+  // Only recover a failure at EOF, never an invalid token in the middle.
+  try { JSON.parse(raw); return call; } catch (error) {
+    const position = error.message.match(/position (\d+)/)?.[1];
+    if (!/unexpected end|unterminated/i.test(error.message) && Number(position) !== raw.length) return call;
+  }
+  // Find property boundaries outside strings and nested values. A candidate
+  // prefix must itself parse as an object; no required values are invented.
+  let depth = 0, quoted = false, escaped = false;
+  const boundaries = [];
+  for (let i = 0; i < raw.length; i++) {
+    const char = raw[i];
+    if (quoted) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') quoted = false;
+    } else if (char === '"') quoted = true;
+    else if (char === "{" || char === "[") { depth++; if (depth === 1 && char === "{") boundaries.push(i + 1); }
+    else if (char === "}" || char === "]") depth--;
+    else if (char === "," && depth === 1) boundaries.push(i + 1);
+  }
+  for (const start of boundaries.slice(-1)) {
+    const field = raw.slice(start).match(/^\s*("(?:[^"\\]|\\.)*")\s*:/);
+    if (!field) continue;
+    // A complete supplied value must not be silently discarded just because
+    // its range or type is invalid. Only an unfinished value may be omitted.
+    try { JSON.parse(raw.slice(start + field[0].length)); continue; } catch { /* incomplete */ }
+    let key, args;
+    try {
+      key = JSON.parse(field[1]);
+      const prefix = raw.slice(0, start).trimEnd().replace(/,$/, "");
+      args = jsonArguments(prefix + "}");
+    } catch { continue; }
+    if (!Object.hasOwn(schema.properties || {}, key) || (schema.required || []).includes(key)
+        || Object.hasOwn(args, key) || !(schema.required || []).every(name => Object.hasOwn(args, name))
+        || Object.keys(args).some(name => !Object.hasOwn(schema.properties || {}, name))) continue;
+    return { ...call, function: { ...call.function, arguments: JSON.stringify(args) } };
+  }
+  return call;
+}
+
+function normalizeToolCall(call, definitions = tools.TOOL_DEFINITIONS) {
+  // Accept providers that return native objects or nest the function envelope
+  // inside arguments. Extract only complete names and preserve argument values.
+  let normalized = call;
+  if (!call.function && typeof call.name === "string") normalized = { ...call, function: { name: call.name, arguments: call.arguments } };
+  if (normalized.function?.arguments && typeof normalized.function.arguments === "object") {
+    normalized = { ...normalized, function: { ...normalized.function, arguments: JSON.stringify(normalized.function.arguments) } };
+  }
+  normalized = closeToolArguments(normalized);
+  try {
+    const parsed = jsonArguments(normalized.function?.arguments);
+    const envelope = parsed.function || parsed;
+    if (typeof envelope.name === "string" && Object.hasOwn(envelope, "arguments")
+        && (!normalized.function?.name || normalized.function.name === envelope.name)
+        && Object.keys(parsed).every(key => (parsed.function ? ["function", "id", "type"] : ["name", "arguments"]).includes(key))) {
+      const args = envelope.arguments;
+      normalized = closeToolArguments({ ...normalized, function: {
+        name: envelope.name, arguments: typeof args === "string" ? args : JSON.stringify(args)
+      } });
+    }
+  } catch { /* Keep invalid input for the normal rejection and retry path. */ }
+  // closeToolArguments also decodes doubly serialized strings when repair is
+  // possible. Decode once here for optional-tail recovery after a failed repair.
+  try {
+    const decoded = JSON.parse(normalized.function?.arguments);
+    if (typeof decoded === "string" && decoded.trimStart().startsWith("{")) {
+      normalized = { ...normalized, function: { ...normalized.function, arguments: decoded } };
+    }
+  } catch { /* Raw incomplete JSON is handled below. */ }
+  return dropIncompleteOptionalArgument(normalized, definitions);
+}
+
 function closeToolArguments(call) {
   let value = call.function?.arguments;
   if (typeof value !== "string") return call;
@@ -57,14 +154,29 @@ function closeToolArguments(call) {
   let parsed;
   try { parsed = jsonArguments(complete); } catch { return call; }
   if (!/["\]}]\s*$|(?:true|false|null)\s*$/.test(value)) {
-    // A read-only line limit can use its literal supplied integer. Never apply
-    // this exception to timeouts, commands, mutations, or arbitrary MCP tools.
-    if (call.function.name !== "read_file" || !/"max_lines"\s*:\s*[1-9]\d*\s*$/.test(value)
-        || typeof parsed.path !== "string" || !Number.isSafeInteger(parsed.max_lines)
-        || parsed.max_lines < 1 || parsed.max_lines > 10000
-        || Object.keys(parsed).some(key => !["path", "max_lines"].includes(key))) return call;
+    // Recover bounded read-only controls using their literal supplied values.
+    if (!numericEndingCanRecover(call, parsed, value)) return call;
   }
   return { ...call, function: { ...call.function, arguments: complete } };
+}
+
+function missingToolRequest(call, definitions) {
+  const name = call.function?.name;
+  if (typeof name !== "string" || !name.trim()) return "tool name is missing";
+  const schema = definitions.find(tool => tool.function.name === name)?.function.parameters;
+  const commandKey = name === "run_plugin_hook" ? "hook_command"
+    : ["run_command", "git", "start_background_process", "record_workspace_server"].includes(name) ? "command" : null;
+  let args;
+  try { args = jsonArguments(call.function.arguments); }
+  catch { return commandKey ? "no complete command arguments were provided" : null; }
+  if (commandKey && (typeof args[commandKey] !== "string" || !args[commandKey].trim())) return commandKey + " is missing";
+  const missing = (schema?.required || []).filter(key => !Object.hasOwn(args, key) || args[key] === null);
+  return missing.length ? "required arguments are missing: " + missing.join(", ") : null;
+}
+
+function noToolCallMessage(call, reason) {
+  return { role: "tool", tool_call_id: call.id,
+    content: "No tool call found: " + reason + ". No tool was executed." };
 }
 
 function toolArguments(call) {
@@ -315,7 +427,14 @@ export class AgentServer {
 
   async toolMessage(toolCall) {
     this.throwIfInterrupted();
-    const name = toolCall.function.name;
+    toolCall = normalizeToolCall(toolCall, [...tools.TOOL_DEFINITIONS, ...(this.mcpRegistry?.toolDefinitions || [])]);
+    const name = toolCall.function?.name || "(missing tool name)";
+    const missing = missingToolRequest(toolCall, [...tools.TOOL_DEFINITIONS, ...(this.mcpRegistry?.toolDefinitions || [])]);
+    if (missing) {
+      const feedback = noToolCallMessage(toolCall, missing);
+      this.ui.message?.(feedback.content);
+      return feedback;
+    }
     let failed = false;
     let result = "";
     let args = {};
@@ -326,11 +445,13 @@ export class AgentServer {
         const reason = /unexpected end|unterminated/i.test(error.message) ? "The JSON was incomplete or truncated." : "The JSON syntax or object type was invalid.";
         throw new Error(`Invalid tool arguments for ${name}. ${reason} No tool was executed. Regenerate the complete JSON object, including its closing quote and brace. Escape quotes and newlines inside string values; keep shell commands short.`);
       }
+      const displayCommand = name === "git" ? "git " + args.command : args.command || args.hook_command;
       this.ui.activity("Working", describeToolStart(name, args), this.ui.MAGENTA, activityTypeForTool(name));
       const command = String(args.command || "");
       let requiresApproval = config.toolRequiresApproval(this.config, name, command);
       if (name === "git" && tools.gitRequiresApproval(command)) requiresApproval = !config.toolAllowedWithoutApproval(this.config, name, `git ${command}`);
       if (requiresApproval && !(await this.confirmToolExecution(name, args))) throw new Error("user denied command approval");
+      this.ui.message?.(displayCommand ? "Running tool: " + name + "\nCommand: " + displayCommand : "Running tool: " + name);
       if (this.mcpRegistry && this.mcpRegistry.hasTool(name)) result = await this.mcpRegistry.callTool(name, args, { signal: this.currentTurn?.controller.signal });
       else {
         const fn = tools.TOOLS[name];
@@ -396,10 +517,19 @@ export class AgentServer {
       // Never treat a delta, a token-limited completion, or a response without
       // a terminal finish reason as a complete tool call, even if JSON parses.
       if (!choice?.message || !["stop", "tool_calls"].includes(choice.finish_reason)) {
-        throw new Error("The model response was incomplete or interrupted. No tools from this response were executed. Retry the turn or increase the model output limit.");
+        const reason = typeof choice?.finish_reason === "string" ? choice.finish_reason : "missing finish reason or message";
+        const feedback = "Harness feedback: your previous response was incomplete (finish reason: "
+          + JSON.stringify(reason) + "). No tools from that response were executed, and its partial text and tool calls were discarded. "
+          + "Decide the next step for the original task using the work already completed. "
+          + "If you need a tool, send a fresh complete call with its tool name and required arguments. "
+          + "Keep calls small, split long commands or file writes into separate steps, and use background tools for long-running jobs. "
+          + "You may explain a blocker or ask for needed information. Do not assume any discarded call ran.";
+        this.messages.push({ role: "user", content: feedback });
+        this.ui.message?.("The previous response was incomplete. No tools ran from it; the agent has been informed and will choose the next step.");
+        continue;
       }
       const message = choice.message.tool_calls?.length
-        ? { ...choice.message, tool_calls: choice.message.tool_calls.map(closeToolArguments) }
+        ? { ...choice.message, tool_calls: choice.message.tool_calls.map(call => normalizeToolCall(call, [...tools.TOOL_DEFINITIONS, ...(this.mcpRegistry?.toolDefinitions || [])])) }
         : choice.message;
       if (invalidToolRounds > 0 && !message.tool_calls?.length) {
         // A rejected call did not execute. Unrelated prose (or an unsupported
@@ -412,7 +542,7 @@ export class AgentServer {
         continue;
       }
       if (message.tool_calls?.some((call, index) => call !== choice.message.tool_calls[index])) {
-        this.ui.activity("Recovered tool arguments", "Normalized JSON encoding or completed missing closing delimiters; argument values were preserved", this.ui.YELLOW, "reasoning");
+        this.ui.activity("Recovered tool arguments", "Recovered JSON tool arguments, including unfinished optional fields; complete values were preserved", this.ui.YELLOW, "reasoning");
       }
       // Retain the original locally for diagnosis. safeToolHistory removes
       // rejected calls and their results from subsequent provider requests.
@@ -435,6 +565,13 @@ export class AgentServer {
       let invalidArguments = false;
       for (const toolCall of message.tool_calls) {
         this.throwIfInterrupted();
+        const missing = missingToolRequest(toolCall, [...tools.TOOL_DEFINITIONS, ...(this.mcpRegistry?.toolDefinitions || [])]);
+        if (missing) {
+          const feedback = noToolCallMessage(toolCall, missing);
+          this.messages.push(feedback);
+          this.ui.message?.(feedback.content);
+          continue;
+        }
         try { toolArguments(toolCall); } catch { invalidArguments = true; }
         this.messages.push(await this.toolMessage(toolCall));
       }
@@ -570,7 +707,8 @@ function safeToolHistory(messages) {
     if (message.role !== "assistant" || !message.tool_calls?.some((c) => rejected.has(c.id))) return [message];
     const tool_calls = message.tool_calls.filter((c) => !rejected.has(c.id));
     const names = [...new Set(message.tool_calls.filter((c) => rejected.has(c.id)).map((c) => c.function?.name))];
-    const feedback = `Tool calls rejected (${names.join(", ")}): incomplete or invalid JSON arguments; these tools did not execute. Return a complete JSON object with closing quotes and braces. Escape embedded quotes and newlines. Use short commands and smaller file writes.`;
+    const missingFeedback = messages.filter(m => m.role === "tool" && rejected.has(m.tool_call_id) && /^No tool call found:/.test(m.content || "")).map(m => m.content);
+    const feedback = missingFeedback.length ? missingFeedback.join("\n") : `Tool calls rejected (${names.join(", ")}): incomplete or invalid JSON arguments; these tools did not execute. Return a complete JSON object with closing quotes and braces. Escape embedded quotes and newlines. Use short commands and smaller file writes.`;
     // Keep valid siblings and their tool results together before feedback.
     return [{ ...message, tool_calls: tool_calls.length ? tool_calls : undefined, content: [message.content, feedback].filter(Boolean).join("\n") }];
   });

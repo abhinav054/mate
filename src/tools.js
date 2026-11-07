@@ -120,7 +120,7 @@ export function editFile({ path: filePath, old_text, new_text, replace_all = fal
   return `edited ${relative(target)}; replacements=${replace_all ? count : 1}`;
 }
 
-export async function runCommand({ command, cwd = ".", max_time_seconds = DEFAULT_TOOL_TIMEOUT_SECONDS, yield_after_seconds = 60 }) {
+export async function runCommand({ command, cwd = ".", max_time_seconds = DEFAULT_TOOL_TIMEOUT_SECONDS, yield_after_seconds = 300 }) {
   const workdir = checkedWorkdir(cwd);
   let recorded = "";
   if (looksLikeServerCommand(command)) recorded = recordWorkspaceServer({ command, cwd });
@@ -130,7 +130,7 @@ export async function runCommand({ command, cwd = ".", max_time_seconds = DEFAUL
   return output;
 }
 
-export async function git({ command, cwd = ".", max_time_seconds = DEFAULT_TOOL_TIMEOUT_SECONDS, yield_after_seconds = 60 }) {
+export async function git({ command, cwd = ".", max_time_seconds = DEFAULT_TOOL_TIMEOUT_SECONDS, yield_after_seconds = 300 }) {
   if (!which("git")) throw new Error("git is not installed");
   const result = await executeCommand("git", gitArgs(command), { cwd: checkedWorkdir(cwd), timeout: toolTimeoutSeconds(max_time_seconds) * 1000, yieldAfterMs: foregroundWindow(yield_after_seconds) });
   return commandResult(result, "git", max_time_seconds);
@@ -152,7 +152,7 @@ function backgroundGuidance(id) {
 }
 
 function foregroundWindow(seconds) {
-  if (!Number.isSafeInteger(seconds) || seconds < 1 || seconds > 60) throw new Error('yield_after_seconds must be an integer between 1 and 60');
+  if (!Number.isSafeInteger(seconds) || seconds < 1 || seconds > 300) throw new Error('yield_after_seconds must be an integer between 1 and 300');
   return seconds * 1000;
 }
 
@@ -188,9 +188,11 @@ function readBackgroundOutput(entry, maxLines) {
     const start = Math.max(0, size - 65536);
     const buffer = Buffer.alloc(Math.min(size, 65536));
     const bytes = fs.readSync(file, buffer, 0, buffer.length, start);
-    const lines = buffer.subarray(0, bytes).toString("utf8").trimEnd().split(/\r?\n/);
+    // Keep each line's original terminator, including trailing blank lines.
+    // Splitting after trimEnd() loses newline-only output and joins log chunks.
+    const lines = buffer.subarray(0, bytes).toString("utf8").match(/[^\n]*\n|[^\n]+$/g) || [];
     if (start > 0 && lines.length > 1) lines.shift();
-    return lines.slice(-maxLines).join("\n");
+    return lines.slice(-maxLines).join("");
   } finally { fs.closeSync(file); }
 }
 
@@ -375,7 +377,7 @@ export function updateTodos({ items_json }) {
   return todos.map((item) => `- [${item.status}] ${item.content}`).join("\n") || "(empty)";
 }
 
-export async function runPluginHook({ plugin_name, hook_command, input_json = "{}", max_time_seconds = DEFAULT_TOOL_TIMEOUT_SECONDS, yield_after_seconds = 60 }) {
+export async function runPluginHook({ plugin_name, hook_command, input_json = "{}", max_time_seconds = DEFAULT_TOOL_TIMEOUT_SECONDS, yield_after_seconds = 300 }) {
   const pluginRoot = resolveInResources(`mate-plugins/${plugin_name}`);
   const env = { ...process.env, MATE_PLUGIN_ROOT: pluginRoot };
   const result = await executeCommand("bash", ["-lc", hook_command], { cwd: activeWorkspace, input: input_json, timeout: toolTimeoutSeconds(max_time_seconds) * 1000, yieldAfterMs: foregroundWindow(yield_after_seconds), env });
@@ -416,10 +418,23 @@ function toolSchema(name) {
     run_plugin_hook: { plugin_name: "string", hook_command: "string", input_json: "string", max_time_seconds: "integer", yield_after_seconds: "integer" },
     record_workspace_server: { command: "string", cwd: "string", reason: "string" }
   };
+  const requiredFields = {
+    browse_internet: ["url"], check_system_tools: [], list_files: [],
+    glob_files: ["pattern"], git: ["command"], read_file: ["path"],
+    touch_file: ["path"], write_file: ["path", "content"],
+    edit_file: ["path", "old_text", "new_text"], record_workspace_server: ["command"],
+    run_command: ["command"], start_background_process: ["command"],
+    read_background_process: ["process_id"], monitor_background_process: ["process_id"],
+    write_background_process: ["process_id", "input_text"], stop_background_process: ["process_id"],
+    list_background_processes: [], request_user_input: ["prompt"],
+    search_files: ["query"], list_agent_resources: [], read_agent_resource: ["path"],
+    load_command: ["command_name"], load_skill: ["skill_name"], load_agent_prompt: ["agent_name"],
+    update_todos: ["items_json"], run_plugin_hook: ["plugin_name", "hook_command"]
+  };
   const spec = schemas[name] || {};
-  return { ...common, properties: Object.fromEntries(Object.entries(spec).map(([key, type]) => [key,
+  return { ...common, required: requiredFields[name] || [], properties: Object.fromEntries(Object.entries(spec).map(([key, type]) => [key,
     key === "max_time_seconds" ? { type, minimum: 1, maximum: MAX_TOOL_TIMEOUT_SECONDS, default: DEFAULT_TOOL_TIMEOUT_SECONDS,
-      description: "Optional execution timeout in seconds. Omit to allow 15 minutes; request up to 2 hours for longer work." } : key === "yield_after_seconds" ? { type, minimum: 1, maximum: 60, default: 60, description: "Foreground wait before a still-running command automatically continues in the background. Retain its process_id; read output or monitor completion without restarting it." } : key === "wait_seconds" ? { type, minimum: 0, maximum: 30, default: 10, description: "Wait up to this many seconds for process completion, then return current status and output. Does not stop a still-running process." } : name === "read_file" && key === "max_lines" ? { type, minimum: 1, maximum: 10000, description: "Optional maximum number of lines to read from the start of the file." } : { type }
+      description: "Optional execution timeout in seconds. Omit to allow 15 minutes; request up to 2 hours for longer work." } : key === "yield_after_seconds" ? { type, minimum: 1, maximum: 300, default: 300, description: "Foreground wait before a still-running command automatically continues in the background. Retain its process_id; read output or monitor completion without restarting it." } : key === "wait_seconds" ? { type, minimum: 0, maximum: 30, default: 10, description: "Wait up to this many seconds for process completion, then return current status and output. Does not stop a still-running process." } : name === "read_file" && key === "max_lines" ? { type, minimum: 1, maximum: 10000, description: "Optional maximum number of lines to read from the start of the file." } : { type }
   ])) };
 }
 

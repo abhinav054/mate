@@ -433,9 +433,9 @@ and accept `max_time_seconds` up to 7200 (2 hours). MCP tool calls wait up to
 2 hours and retain cancellation support. Explicit shorter tool timeouts are
 respected. Persistent development servers should still use background processes.
 Command, Git, and plugin-hook output streams to the workspace while the tool is
-running. Commands, Git, and plugin hooks that exceed the 60-second foreground
+running. Commands, Git, and plugin hooks that exceed the five-minute foreground
 window automatically continue in the background without restarting. Set
-`yield_after_seconds` (1–60) to adjust that window. The returned
+`yield_after_seconds` (1–300) to adjust that window. The returned
 `background_process_id` identifies the job; backgrounding is not exit success.
 The original `max_time_seconds` execution deadline still applies after handoff.
 

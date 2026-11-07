@@ -69,7 +69,7 @@ test("Mate startup exposes configured skills before the first setup turn", async
   }
 });
 
-test("successful skill use sends a client message; discovery and failures do not", async () => {
+test("successful skill use announces the skill alongside tool chat messages", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "mate-skill-message-"));
   const previousHome = process.env.MATE_HOME;
   try {
@@ -80,13 +80,13 @@ test("successful skill use sends a client message; discovery and failures do not
     const server = new AgentServer({ messages: [], mateConfig: { approval: { auto_approve: true } }, ui: { activity() {}, message: text => messages.push(text) } });
     const call = (name, args) => server.toolMessage({ id: "test-call", function: { name, arguments: JSON.stringify(args) } });
     await call("list_agent_resources", { kind: "skills" });
-    assert.deepEqual(messages, []);
+    assert.deepEqual(messages, ["Running tool: list_agent_resources"]);
     assert.equal((await call("load_skill", { skill_name: "deploymate" })).content, "Deployment instructions");
-    assert.deepEqual(messages, ["Using skill: deploymate"]);
+    assert.deepEqual(messages.filter(text => text.startsWith("Using skill:")), ["Using skill: deploymate"]);
     await call("load_skill", { skill_name: "missing-test-skill" });
-    assert.equal(messages.length, 1);
+    assert.equal(messages.filter(text => text.startsWith("Using skill:")).length, 1);
     await call("read_agent_resource", { path: "skills/deploymate/SKILL.md" });
-    assert.deepEqual(messages, ["Using skill: deploymate", "Using skill: deploymate"]);
+    assert.deepEqual(messages.filter(text => text.startsWith("Using skill:")), ["Using skill: deploymate", "Using skill: deploymate"]);
   } finally {
     if (previousHome === undefined) delete process.env.MATE_HOME; else process.env.MATE_HOME = previousHome;
     fs.rmSync(root, { recursive: true, force: true });

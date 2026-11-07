@@ -18,8 +18,8 @@ function createAgent(create, ui = { activity() {} }) {
 test('foreground schema defaults to sixty seconds independently of bounded monitor waits', () => {
   for (const name of ['run_command', 'git', 'run_plugin_hook']) {
     const schema = TOOL_DEFINITIONS.find(t => t.function.name === name).function.parameters.properties;
-    assert.equal(schema.yield_after_seconds.default, 60);
-    assert.equal(schema.yield_after_seconds.maximum, 60);
+    assert.equal(schema.yield_after_seconds.default, 300);
+    assert.equal(schema.yield_after_seconds.maximum, 300);
   }
   assert.equal(TOOL_DEFINITIONS.find(t => t.function.name === 'monitor_background_process').function.parameters.properties.wait_seconds.maximum, 30);
 });

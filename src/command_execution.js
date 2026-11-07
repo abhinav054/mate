@@ -89,7 +89,7 @@ export async function executeCommand(command, args, options) {
     drain();
     const final = decoder.end();
     if (final) { tail = (tail + final).slice(-65536); onOutput?.(final); }
-    return { ...result, output: tail.trimEnd(), logFile, entry };
+    return { ...result, output: tail, logFile, entry };
   } catch (error) {
     clearTimeout(timer);
     if (entry && !entry.result) stop();

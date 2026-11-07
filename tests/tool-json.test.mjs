@@ -110,17 +110,30 @@ test('requests explicitly disable streaming and await the full response before r
 });
 
 for (const reason of [null, undefined, 'length', 'content_filter']) {
-  test(`does not execute even valid JSON tools when finish_reason is ${reason}`, async () => {
-    const { agent, executed } = server(async () => ({ choices: [{ finish_reason: reason, message: { role: 'assistant', tool_calls: [call('partial', '{"value":1}')] } }] }));
-    await assert.rejects(agent.runAgentUntilAnswer(), /response was incomplete/);
+  test(`incomplete finish_reason ${reason} informs the agent without executing partial calls`, async () => {
+    let requests = 0;
+    const { agent, executed } = server(async ({messages}) => {
+      if (++requests === 1) return { choices: [{ finish_reason: reason, message: { role: 'assistant', content: 'partial answer',
+        tool_calls: [call('partial', '{"value":1}')] } }] };
+      assert.match(messages.at(-1).content, /Harness feedback:.*incomplete/);
+      assert.match(messages.at(-1).content, /No tools.*were executed/);
+      assert.equal(messages.some(m => m.role === 'assistant'), false);
+      return { choices: [{ finish_reason: 'stop', message: {role:'assistant',content:'I need more information.'} }] };
+    });
+    assert.equal(await agent.runAgentUntilAnswer(), 'I need more information.');
+    assert.equal(requests, 2);
     assert.deepEqual(executed, []);
-    assert.deepEqual(agent.messages, []);
   });
 }
 
-test('a streaming delta cannot be executed as a complete message', async () => {
-  const { agent, executed } = server(async () => ({ choices: [{ finish_reason: null, delta: { tool_calls: [call('fragment', '{"value":')] } }] }));
-  await assert.rejects(agent.runAgentUntilAnswer(), /response was incomplete/);
+test('a streaming delta informs the agent without executing a partial call', async () => {
+  let requests = 0;
+  const { agent, executed } = server(async ({messages}) => {
+    if (++requests === 1) return { choices: [{ finish_reason: null, delta: { tool_calls: [call('fragment', '{"value":')] } }] };
+    assert.match(messages.at(-1).content, /discarded/);
+    return {choices:[{finish_reason:'stop',message:{role:'assistant',content:'Need input'}}]};
+  });
+  assert.equal(await agent.runAgentUntilAnswer(),'Need input');
   assert.deepEqual(executed, []);
 });
 
@@ -228,7 +241,7 @@ for (const encoded of [false, true]) {
   });
 }
 
-for (const args of ['{"path":"a","max_lines":1e', '{"path":"a","max_lines":0', '{"path":"a","max_lines":10001', '{"path":"a","max_lines":10,"other":5']) {
+for (const args of ['{"path":"a","max_lines":0', '{"path":"a","max_lines":10001', '{"path":"a","max_lines":10,"other":5']) {
   test(`read_file does not guess invalid or unsupported numeric endings: ${args}`, async () => {
     const { agent, executed } = server(async () => ({ choices: [{ finish_reason: 'tool_calls', message: { role: 'assistant', tool_calls: [{ id: 'bad', function: { name: 'read_file', arguments: args } }] } }] }));
     await assert.rejects(agent.runAgentUntilAnswer(), /Stopped after three attempts/);
@@ -272,8 +285,197 @@ test('delimiter recovery preserves quotes, escapes and braces inside command val
   assert.deepEqual(executed,[{command}]);
 });
 
-test('a transport-level incomplete response never receives delimiter repair or execution', async () => {
-  const {agent,executed}=server(async ()=>({choices:[{finish_reason:'length',message:{role:'assistant',tool_calls:[call('partial','{"path":"."')]}}]}));
-  await assert.rejects(agent.runAgentUntilAnswer(),/response was incomplete/);
+test('incomplete responses let the agent choose a fresh complete tool call', async () => {
+  let requests=0;
+  const {agent,executed}=server(async ({messages})=>{
+    if(++requests===1) return {choices:[{finish_reason:'length',message:{role:'assistant',tool_calls:[call('partial','{"path":"."')]}}]};
+    if(requests===2) {
+      assert.match(messages.at(-1).content,/Decide the next step/);
+      return {choices:[{finish_reason:'tool_calls',message:{role:'assistant',tool_calls:[call('fresh','{"path":"."}')]}}]};
+    }
+    return {choices:[{finish_reason:'stop',message:{role:'assistant',content:'Checked'}}]};
+  });
+  assert.equal(await agent.runAgentUntilAnswer(),'Checked');
+  assert.deepEqual(executed,[{path:'.'}]);
+});
+
+test('repeated incomplete responses do not fail setup and missing choices are reported', async () => {
+  let requests=0;
+  const {agent,executed}=server(async ({messages})=>{
+    if(++requests<=4) return requests===1 ? {} : {choices:[{finish_reason:'length',message:{role:'assistant',content:'partial'}}]};
+    assert.equal(messages.filter(m=>m.content?.startsWith('Harness feedback:')).length,4);
+    return {choices:[{finish_reason:'stop',message:{role:'assistant',content:'Please provide a smaller task.'}}]};
+  });
+  assert.equal(await agent.runAgentUntilAnswer(),'Please provide a smaller task.');
   assert.deepEqual(executed,[]);
+});
+
+test('user cancellation still interrupts instead of feeding cancellation back to the model', async () => {
+  const {agent}=server(async ()=>{agent.interruptCurrentTurn(); return {};});
+  agent.currentTurn={controller:new AbortController()};
+  await assert.rejects(agent.runAgentUntilAnswer(),/interrupt/i);
+  assert.deepEqual(agent.messages,[]);
+});
+
+for (const args of [
+  '{"process_id":"build","wait_seconds":30',
+  '{"process_id":"build","wait_seconds":0',
+  '{"process_id":"build","wait_seconds":30,"max_lines":120',
+  '{"name":"monitor_background_process","arguments":{"process_id":"build","wait_seconds":30',
+  '{"function":{"name":"monitor_background_process","arguments":{"process_id":"build","wait_seconds":30'
+]) {
+  test('monitor recovers complete values from incomplete JSON: ' + args, async () => {
+    let requests = 0;
+    const { agent, executed } = server(async ({ messages }) => {
+      if (++requests === 1) return { choices: [{ finish_reason: 'tool_calls', message: { role: 'assistant',
+        tool_calls: [{ id: 'monitor', function: { name: 'monitor_background_process', arguments: args } }] } }] };
+      const replay = messages[0].tool_calls[0];
+      assert.equal(replay.function.name, 'monitor_background_process');
+      assert.equal(JSON.parse(replay.function.arguments).process_id, 'build');
+      return { choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: 'Monitored' } }] };
+    });
+    assert.equal(await agent.runAgentUntilAnswer(), 'Monitored');
+    assert.equal(executed.length, 1);
+    assert.equal(executed[0].process_id, 'build');
+    assert.equal(requests, 2);
+  });
+}
+
+for (const args of [
+  '{"process_id":"build","wait_seconds":31',
+  '{"process_id":"unfinished',
+  '{"process_id":"build","max_lines":601',
+  '{"process_id":"build","wait_seconds":30,"unknown":1'
+]) {
+  test('monitor leaves ambiguous or invalid JSON for retry: ' + args, async () => {
+    const { agent, executed } = server(async () => {});
+    const result = await agent.toolMessage({ id: 'bad', function: { name: 'monitor_background_process', arguments: args } });
+    assert.match(result.content, /No tool was executed/);
+    assert.deepEqual(executed, []);
+  });
+}
+
+test('extracts a missing tool name from an incomplete function envelope', async () => {
+  let requests = 0;
+  const { agent, executed } = server(async ({ messages }) => {
+    if (++requests === 1) return { choices: [{ finish_reason: 'tool_calls', message: { role: 'assistant',
+      tool_calls: [{ id: 'wrapped', function: { arguments: '{"name":"monitor_background_process","arguments":{"process_id":"build","wait_seconds":30' } }] } }] };
+    assert.equal(messages[0].tool_calls[0].function.name, 'monitor_background_process');
+    return { choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: 'done' } }] };
+  });
+  assert.equal(await agent.runAgentUntilAnswer(), 'done');
+  assert.deepEqual(executed, [{ process_id: 'build', wait_seconds: 30 }]);
+});
+
+test('native argument objects are normalized without changing their values', async () => {
+  const { agent, executed } = server(async () => {});
+  assert.equal((await agent.toolMessage({ id: 'object', function: {
+    name: 'monitor_background_process', arguments: { process_id: 'build', wait_seconds: 0 }
+  } })).content, 'ok');
+  assert.deepEqual(executed, [{ process_id: 'build', wait_seconds: 0 }]);
+});
+
+for (const [name, raw, expected] of [
+  ['read_file', '{"path":"/workspace/app/db.py","max_lines":', {path:'/workspace/app/db.py'}],
+  ['run_command', '{"command":"echo ok","max_time_seconds":', {command:'echo ok'}],
+  ['git', '{"command":"status","cwd":"unfinished', {command:'status'}],
+  ['monitor_background_process', '{"process_id":"build","wait_seconds":', {process_id:'build'}],
+  ['write_file', '{"path":"a","content":"kept","append":tru', {path:'a',content:'kept'}],
+  ['edit_file', '{"path":"a","old_text":"x","new_text":"y","replace_all":', {path:'a',old_text:'x',new_text:'y'}],
+  ['run_plugin_hook', '{"plugin_name":"p","hook_command":"build","input_json":"unfinished', {plugin_name:'p',hook_command:'build'}],
+  ['read_file', '{"path":"a","max_lines":1e', {path:'a'}],
+  ['list_files', '{"path":', {}],
+]) {
+  for (const encoded of [false, true]) test(name + ' omits unfinished optional field (encoded=' + encoded + ')', async () => {
+    let requests = 0;
+    const { agent, executed } = server(async ({messages}) => {
+      if (++requests === 1) return {choices:[{finish_reason:'tool_calls',message:{role:'assistant',tool_calls:[
+        {id:'recover',function:{name,arguments:encoded ? JSON.stringify(raw) : raw}}
+      ]}}]};
+      assert.deepEqual(JSON.parse(messages[0].tool_calls[0].function.arguments), expected);
+      return {choices:[{finish_reason:'stop',message:{role:'assistant',content:'done'}}]};
+    });
+    assert.equal(await agent.runAgentUntilAnswer(),'done');
+    assert.deepEqual(executed,[expected]);
+  });
+}
+
+for (const [name, raw] of [
+  ['run_command', '{"cwd":".","max_time_seconds":'],
+  ['write_file', '{"path":"a","append":'],
+  ['write_file', '{"path":"a","content":"unfinished'],
+  ['read_file', '{"path":"a","unknown":'],
+  ['read_file', '{"path":"a","max_lines":oops'],
+  ['read_file', '{"path":"a"oops,"max_lines":'],
+  ['read_file', '{"path":"a","max_lines":2,"max_lines":'],
+]) test(name + ' rejects missing required or invalid fields: ' + raw, async () => {
+  const {agent,executed}=server(async()=>{});
+  assert.match((await agent.toolMessage({id:'bad',function:{name,arguments:raw}})).content,/No tool was executed/);
+  assert.deepEqual(executed,[]);
+});
+
+test('MCP schemas support unfinished nested optional values', async () => {
+  const {agent,executed}=server(async()=>{});
+  agent.mcpRegistry.toolDefinitions=[{type:'function',function:{name:'external',parameters:{
+    type:'object',required:['target'],properties:{target:{type:'string'},options:{type:'object'}}
+  }}}];
+  const result=await agent.toolMessage({id:'mcp',function:{name:'external',arguments:'{"target":"a","options":{"nested":[1,'}});
+  assert.equal(result.content,'ok');
+  assert.deepEqual(executed,[{target:'a'}]);
+});
+
+test('every built-in tool declares its required arguments', async () => {
+  const {TOOL_DEFINITIONS}=await import('../src/tools.js');
+  for(const tool of TOOL_DEFINITIONS) {
+    assert.ok(Array.isArray(tool.function.parameters.required),tool.function.name);
+    for(const key of tool.function.parameters.required) assert.ok(tool.function.parameters.properties[key]);
+  }
+});
+
+for (const tool of [
+  {name:'run_command',arguments:'{}'},
+  {name:'run_command',arguments:'{"command":"  "}'},
+  {name:'run_command',arguments:'{"command":"unfinished'},
+  {name:'run_plugin_hook',arguments:'{"plugin_name":"p"}'},
+  {name:'read_file',arguments:'{}'},
+  {arguments:'{}'},
+]) test('missing requests send no-call feedback without execution or retry: ' + JSON.stringify(tool), async () => {
+  const {installToolEvents}=await import('../src/tool_events.js');
+  let requests=0;
+  const {agent,executed}=server(async ({messages})=>{
+    if(++requests===1) return {choices:[{finish_reason:'tool_calls',message:{role:'assistant',tool_calls:[{id:'missing',function:tool}]}}]};
+    assert.ok(messages.some(m=>m.content?.includes('No tool call found:')));
+    return {choices:[{finish_reason:'stop',message:{role:'assistant',content:'No action was taken.'}}]};
+  });
+  const chat=[],events=[];
+  agent.ui.message=text=>chat.push(text);
+  installToolEvents(agent,(...event)=>events.push(event));
+  assert.equal(await agent.runAgentUntilAnswer(),'No action was taken.');
+  assert.equal(requests,2);
+  assert.deepEqual(executed,[]);
+  assert.deepEqual(events,[]);
+  assert.match(chat[0],/^No tool call found:/);
+  assert.equal(chat.some(text=>text.startsWith('Running tool:')),false);
+});
+
+test('tool name and actual shell command are sent to chat before execution', async ()=>{
+  const {agent}=server(async()=>{});
+  const chat=[];
+  agent.ui.message=text=>chat.push(text);
+  agent.mcpRegistry.callTool=async(name,args)=>{
+    assert.equal(name,'git');
+    assert.equal(args.command,'status --short');
+    assert.deepEqual(chat,['Running tool: git\nCommand: git status --short']);
+    return 'ok';
+  };
+  assert.equal((await agent.toolMessage({id:'git',function:{name:'git',arguments:'{"command":"status --short"}'}})).content,'ok');
+});
+
+test('tools without shell commands send their names to chat', async ()=>{
+  const {agent,executed}=server(async()=>{});
+  const chat=[];
+  agent.ui.message=text=>chat.push(text);
+  await agent.toolMessage({id:'read',function:{name:'read_file',arguments:'{"path":"a"}'}});
+  assert.deepEqual(chat,['Running tool: read_file']);
+  assert.deepEqual(executed,[{path:'a'}]);
 });

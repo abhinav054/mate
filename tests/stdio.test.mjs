@@ -288,3 +288,28 @@ test('interrupting a turn pauses background follow-ups until a user starts anoth
     await server;
   } finally { input.end(); }
 });
+
+test('tool announcements use standard Codex commentary without custom fields',async()=>{
+  const input=new PassThrough(),output=new PassThrough();
+  const events=[];let buffer='';
+  output.on('data',chunk=>{
+    buffer+=chunk.toString();
+    const lines=buffer.split('\n');buffer=lines.pop();
+    events.push(...lines.map(JSON.parse));
+  });
+  const server=runStdioServer({workspace:tmpdir(),input,output,createAgent:async(_workspace,ui)=>({
+    async toolMessage(){return {};},
+    async runTurn(){ui.message('Running tool: run_command\nCommand: pwd',{toolCallId:'call-1'});return 'Done';}
+  })});
+  try{
+    const response=await rpc(input,output,1,'turn/start',{prompt:'check'});
+    const item=response.result.turn.items[0];
+    assert.equal(item.toolCallId,undefined);
+    assert.equal(item.phase,'commentary');
+    assert.equal(item.type,'agentMessage');
+    const notification=events.find(e=>e.method==='item/completed'&&e.params.item.phase==='commentary');
+    assert.deepEqual(notification.params.item,item);
+    assert.equal(response.result.turn.items[1].toolCallId,undefined);
+    await rpc(input,output,2,'shutdown');await server;
+  }finally{input.end();}
+});

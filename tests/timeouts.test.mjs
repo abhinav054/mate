@@ -26,7 +26,7 @@ test('native executions default to fifteen minutes and accept explicit long budg
   try {
     await runCommand({command:'build'});
     assert.equal(delays.at(-2),900000);
-    assert.equal(delays.at(-1),60000);
+    assert.equal(delays.at(-1),300000);
     await runCommand({command:'build',max_time_seconds:3600});
     assert.equal(delays.at(-2),3600000);
     await runCommand({command:'build',max_time_seconds:99999});
@@ -35,10 +35,10 @@ test('native executions default to fifteen minutes and accept explicit long budg
     assert.equal(delays.at(-2),5000);
     await git({command:'status'});
     assert.equal(delays.at(-2),900000);
-    assert.equal(delays.at(-1),60000);
+    assert.equal(delays.at(-1),300000);
     await runPluginHook({plugin_name:'example',hook_command:'build'});
     assert.equal(delays.at(-2),900000);
-    assert.equal(delays.at(-1),60000);
+    assert.equal(delays.at(-1),300000);
     browseInternet({url:'https://example.invalid'});
     const curl=calls.at(-1);
     assert.equal(curl.args[curl.args.indexOf('--max-time')+1],'900');
