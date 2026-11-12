@@ -22,7 +22,8 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
-    "openai": "^4.104.0"
+    "openai": "^4.104.0",
+    "partial-json": "^0.1.7"
   },
   "engines": {
     "node": ">=20"

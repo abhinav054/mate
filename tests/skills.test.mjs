@@ -83,6 +83,7 @@ test("successful skill use announces the skill alongside tool chat messages", as
     assert.deepEqual(messages, ["Running tool: list_agent_resources"]);
     assert.equal((await call("load_skill", { skill_name: "deploymate" })).content, "Deployment instructions");
     assert.deepEqual(messages.filter(text => text.startsWith("Using skill:")), ["Using skill: deploymate"]);
+    assert.equal(messages.includes("Running tool: load_skill"), false);
     await call("load_skill", { skill_name: "missing-test-skill" });
     assert.equal(messages.filter(text => text.startsWith("Using skill:")).length, 1);
     await call("read_agent_resource", { path: "skills/deploymate/SKILL.md" });

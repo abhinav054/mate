@@ -134,7 +134,11 @@ export async function runStdioServer({ workspace, input = process.stdin, output 
         }
         agent = installSkillDiscovery(await factory(workspace, ui, options));
         installMateUsage(agent.client);
-        installPermissions(agent, policy, { setup: () => setup, approve: async (tool) => (await request("mate/approval/request", { prompt: `Allow ${tool}?` }))?.approved === true });
+        installPermissions(agent, policy, { setup: () => setup, approve: async (tool, argumentsValue) => {
+          let args = argumentsValue ?? {};
+          if (typeof args === "string") { try { args = JSON.parse(args); } catch { /* Show malformed arguments as received. */ } }
+          return (await request("mate/approval/request", { prompt: `Allow ${tool}?`, tool, arguments: args }))?.approved === true;
+        } });
         toolEvents = installToolEvents(agent, notify, () => currentTurn);
       }
       if (message.method === "conversation/resume") {

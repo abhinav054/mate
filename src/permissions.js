@@ -6,7 +6,7 @@ export function toolPermission(agent, policy, name) {
   const mapped = agent.mcpRegistry?.toolMap?.get(name);
   if (mapped) return policy.mcp?.[mapped.serverName] || "ask";
   if (name.startsWith("mcp__")) return "deny";
-  if (name === "request_user_input") return "allow";
+  if (name === "request_user_input" || name === "load_skill") return "allow";
   const category = readTools.has(name) ? "read" : writeTools.has(name) ? "write" : commandTools.has(name) ? "commands" : name === "browse_internet" ? "network" : null;
   return category ? policy.permissions?.[category] || "ask" : "deny";
 }
@@ -28,7 +28,7 @@ export function installPermissions(agent, policy, { setup, approve }) {
     if (setup()) return original(call);
     const name = call.function.name;
     const mode = toolPermission(agent, policy, name);
-    if (mode === "allow" || (mode === "ask" && await approve(name))) return original(call);
+    if (mode === "allow" || (mode === "ask" && await approve(name, call.function.arguments))) return original(call);
     return { role: "tool", tool_call_id: call.id, content: `ERROR: Agent permissions denied tool: ${name}` };
   };
   return agent;

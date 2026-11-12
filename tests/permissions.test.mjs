@@ -68,3 +68,27 @@ test('native command approvals are bypassed only during server-owned setup', asy
  assert.equal(nativeApprovals,1);
  assert.equal(executions,1);
 });
+
+test('approval receives the exact pending tool arguments before execution', async () => {
+ const args = JSON.stringify({command:'rm -- "old file.txt"',cwd:'/workspace/app'});
+ let executed=false;
+ const agent={toolMessage:async()=>{executed=true;return {content:'ok'}}};
+ installPermissions(agent,{permissions:{commands:'ask'}},{setup:()=>false,approve:async(name,value)=>{assert.equal(name,'run_command');assert.equal(value,args);assert.equal(executed,false);return false}});
+ await agent.toolMessage({id:'pending',function:{name:'run_command',arguments:args}});
+ assert.equal(executed,false);
+});
+
+
+test('loading skills never asks, while skill actions retain their permissions', async () => {
+ const {toolRequiresApproval}=await import('../src/config.js');
+ assert.equal(toolRequiresApproval({approval:{require_tools:new Set(['load_skill'])}},'load_skill'),false);
+ for(const read of ['ask','deny']) {
+  const executed=[];
+  const agent={toolMessage:async call=>{executed.push(call.function.name);return {content:'instructions'};}};
+  installPermissions(agent,{permissions:{read,commands:'deny',write:'deny'}},{setup:()=>false,approve:async()=>assert.fail('load_skill asked for approval')});
+  await agent.toolMessage({id:'skill',function:{name:'load_skill',arguments:'{"skill_name":"deploymate"}'}});
+  await agent.toolMessage({id:'command',function:{name:'run_command',arguments:'{"command":"deploy"}'}});
+  await agent.toolMessage({id:'write',function:{name:'write_file',arguments:'{"path":"x","content":"y"}'}});
+  assert.deepEqual(executed,['load_skill']);
+ }
+});

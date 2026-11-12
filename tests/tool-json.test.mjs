@@ -75,7 +75,7 @@ test('legacy empty calls with invalid-argument errors are removed with their res
   assert.equal(messages[0].tool_calls.length, 2);
 });
 
-test('repeated malformed output stops after three responses without executing any tool', async () => {
+test('repeated malformed output receives alternative guidance before bounded stop', async () => {
   let requests = 0;
   const { agent, executed } = server(async ({ messages }) => {
     for (const m of messages) for (const c of m.tool_calls || []) JSON.parse(c.function.arguments);
@@ -83,7 +83,7 @@ test('repeated malformed output stops after three responses without executing an
     return { choices: [{ finish_reason: 'tool_calls', message: { role: 'assistant', tool_calls: [call(`bad-${requests}`, '{"command": "incomplete')] } }] };
   });
   await assert.rejects(agent.runAgentUntilAnswer(), /Stopped after three attempts/);
-  assert.equal(requests, 3);
+  assert.equal(requests, 6);
   assert.deepEqual(executed, []);
 });
 
@@ -137,15 +137,19 @@ test('a streaming delta informs the agent without executing a partial call', asy
   assert.deepEqual(executed, []);
 });
 
-test('an unrelated answer after a rejected call cannot complete the turn or enter history', async () => {
+test('after rejected-call correction limit the model may report the blocker without inventing work', async () => {
   let requests = 0;
-  const { agent, executed } = server(async () => {
+  const { agent, executed } = server(async ({messages}) => {
     if (requests++ === 0) return { choices: [{ finish_reason: 'tool_calls', message: {
       role: 'assistant', tool_calls: [call('bad-timeout', '{"command":"echo ok","max_time_seconds":')]
     } }] };
+    if(requests===4){
+      assert.match(messages.at(-1).content,/independent tasks/);
+      return {choices:[{finish_reason:'stop',message:{role:'assistant',content:'The requested command remains blocked; nothing ran.'}}]};
+    }
     return { choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: 'Curso-Java-basico\nInvented Java code' } }] };
   });
-  await assert.rejects(agent.runAgentUntilAnswer(), /could not recover its rejected tool call after three attempts/);
+  assert.equal(await agent.runAgentUntilAnswer(),'The requested command remains blocked; nothing ran.');
   assert.deepEqual(executed, []);
   assert.equal(agent.messages.some(m => m.content?.includes('Invented Java code')), false);
 });
@@ -207,6 +211,7 @@ test('missing closing delimiters are normalized before execution, events and his
     assert.equal(messages[1].content,'ok');
     return {choices:[{finish_reason:'stop',message:{role:'assistant',content:'Checked'}}]};
   });
+  agent.mcpRegistry.toolDefinitions=[{type:'function',function:{name:'test_tool',parameters:{type:'object',required:['path','options'],properties:{path:{type:'string'},options:{type:'object',required:['flags'],properties:{flags:{type:'array',items:{type:'string'}}}}}}}}];
   assert.equal(await agent.runAgentUntilAnswer(),'Checked');
   assert.deepEqual(executed,[{path:'.',options:{flags:['safe']}}]);
   assert.equal(original.function.arguments,'{"path":".","options":{"flags":["safe"]');
@@ -232,20 +237,23 @@ for (const encoded of [false, true]) {
       if (++requests === 1) return { choices: [{ finish_reason: 'tool_calls', message: { role: 'assistant', tool_calls: [{
         id: 'read', function: { name: 'read_file', arguments: encoded ? JSON.stringify(raw) : raw }
       }] } }] };
-      assert.deepEqual(JSON.parse(messages[0].tool_calls[0].function.arguments), { path: '/workspace/app/main.py', max_lines: 10 });
+      assert.deepEqual(JSON.parse(messages[0].tool_calls[0].function.arguments), { path: '/workspace/app/main.py' });
       return { choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: 'Read file' } }] };
     });
     assert.equal(await agent.runAgentUntilAnswer(), 'Read file');
-    assert.deepEqual(executed, [{ path: '/workspace/app/main.py', max_lines: 10 }]);
+    assert.deepEqual(executed, [{ path: '/workspace/app/main.py' }]);
     assert.equal(requests, 2);
   });
 }
 
 for (const args of ['{"path":"a","max_lines":0', '{"path":"a","max_lines":10001', '{"path":"a","max_lines":10,"other":5']) {
-  test(`read_file does not guess invalid or unsupported numeric endings: ${args}`, async () => {
-    const { agent, executed } = server(async () => ({ choices: [{ finish_reason: 'tool_calls', message: { role: 'assistant', tool_calls: [{ id: 'bad', function: { name: 'read_file', arguments: args } }] } }] }));
-    await assert.rejects(agent.runAgentUntilAnswer(), /Stopped after three attempts/);
-    assert.deepEqual(executed, []);
+  test(`partial-json omits unfinished numeric fields without guessing them: ${args}`, async () => {
+    let requests=0;
+    const {agent,executed}=server(async()=>++requests===1
+      ? {choices:[{finish_reason:'tool_calls',message:{role:'assistant',tool_calls:[{id:'partial',function:{name:'read_file',arguments:args}}]}}]}
+      : {choices:[{finish_reason:'stop',message:{role:'assistant',content:'Done'}}]});
+    await agent.runAgentUntilAnswer();
+    assert.deepEqual(executed,[args.includes('"other"')?{path:'a',max_lines:10}:{path:'a'}]);
   });
 }
 
@@ -281,6 +289,7 @@ test('delimiter recovery preserves quotes, escapes and braces inside command val
   const value = JSON.stringify({command});
   let requests=0;
   const {agent,executed}=server(async ()=>({choices:[{finish_reason:++requests===1?'tool_calls':'stop',message:requests===1?{role:'assistant',tool_calls:[call('quoted',value.slice(0,-1))]}:{role:'assistant',content:'done'}}]}));
+  agent.mcpRegistry.toolDefinitions=[{type:'function',function:{name:'test_tool',parameters:{type:'object',required:['command'],properties:{command:{type:'string'}}}}}];
   assert.equal(await agent.runAgentUntilAnswer(),'done');
   assert.deepEqual(executed,[{command}]);
 });
@@ -342,10 +351,10 @@ for (const args of [
 }
 
 for (const args of [
-  '{"process_id":"build","wait_seconds":31',
+  '{"process_id":"build","wait_seconds":"31"',
   '{"process_id":"unfinished',
-  '{"process_id":"build","max_lines":601',
-  '{"process_id":"build","wait_seconds":30,"unknown":1'
+  '{"process_id":"build","max_lines":"601"',
+  '{"process_id":"build","wait_seconds":30,"unknown":oops'
 ]) {
   test('monitor leaves ambiguous or invalid JSON for retry: ' + args, async () => {
     const { agent, executed } = server(async () => {});
@@ -364,7 +373,7 @@ test('extracts a missing tool name from an incomplete function envelope', async 
     return { choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: 'done' } }] };
   });
   assert.equal(await agent.runAgentUntilAnswer(), 'done');
-  assert.deepEqual(executed, [{ process_id: 'build', wait_seconds: 30 }]);
+  assert.deepEqual(executed, [{ process_id: 'build' }]);
 });
 
 test('native argument objects are normalized without changing their values', async () => {
@@ -404,10 +413,8 @@ for (const [name, raw] of [
   ['run_command', '{"cwd":".","max_time_seconds":'],
   ['write_file', '{"path":"a","append":'],
   ['write_file', '{"path":"a","content":"unfinished'],
-  ['read_file', '{"path":"a","unknown":'],
   ['read_file', '{"path":"a","max_lines":oops'],
   ['read_file', '{"path":"a"oops,"max_lines":'],
-  ['read_file', '{"path":"a","max_lines":2,"max_lines":'],
 ]) test(name + ' rejects missing required or invalid fields: ' + raw, async () => {
   const {agent,executed}=server(async()=>{});
   assert.match((await agent.toolMessage({id:'bad',function:{name,arguments:raw}})).content,/No tool was executed/);
@@ -421,7 +428,7 @@ test('MCP schemas support unfinished nested optional values', async () => {
   }}}];
   const result=await agent.toolMessage({id:'mcp',function:{name:'external',arguments:'{"target":"a","options":{"nested":[1,'}});
   assert.equal(result.content,'ok');
-  assert.deepEqual(executed,[{target:'a'}]);
+  assert.deepEqual(executed,[{target:'a',options:{}}]);
 });
 
 test('every built-in tool declares its required arguments', async () => {
@@ -435,7 +442,6 @@ test('every built-in tool declares its required arguments', async () => {
 for (const tool of [
   {name:'run_command',arguments:'{}'},
   {name:'run_command',arguments:'{"command":"  "}'},
-  {name:'run_command',arguments:'{"command":"unfinished'},
   {name:'run_plugin_hook',arguments:'{"plugin_name":"p"}'},
   {name:'read_file',arguments:'{}'},
   {arguments:'{}'},
@@ -478,4 +484,107 @@ test('tools without shell commands send their names to chat', async ()=>{
   await agent.toolMessage({id:'read',function:{name:'read_file',arguments:'{"path":"a"}'}});
   assert.deepEqual(chat,['Running tool: read_file']);
   assert.deepEqual(executed,[{path:'a'}]);
+});
+
+for (const raw of ['{"serviceId": 25', JSON.stringify('{"serviceId": 25'), JSON.stringify('{"serviceId": tru')]) {
+ test('malformed MCP service ID receives schema-guided regeneration: ' + raw, async () => {
+  let requests = 0;
+  const name = 'mcp__deploymate__get_service_environment';
+  const {agent, executed} = server(async ({messages}) => {
+   if (++requests === 1) return {choices:[{finish_reason:'tool_calls',message:{role:'assistant',tool_calls:[
+    {id:'bad-service',type:'function',function:{name,arguments:raw}}
+   ]}}]};
+   if (requests === 2) {
+    assert.deepEqual(executed, []);
+    const feedback = messages.at(-1);
+    assert.equal(feedback.role, 'user');
+    assert.match(feedback.content, /not a quoted or double-encoded JSON string/);
+    assert.match(feedback.content, /never guess a truncated number/);
+    assert.match(feedback.content, /"serviceId":\{"type":"integer"\}/);
+    assert.equal(messages.some(m => m.tool_calls?.some(c => c.id === 'bad-service')), false);
+    return {choices:[{finish_reason:'tool_calls',message:{role:'assistant',tool_calls:[
+     {id:'fresh-service',type:'function',function:{name,arguments:'{"serviceId":25}'}}
+    ]}}]};
+   }
+   return {choices:[{finish_reason:'stop',message:{role:'assistant',content:'Environment retrieved'}}]};
+  });
+  agent.mcpRegistry.toolDefinitions = [{type:'function',function:{name,parameters:{type:'object',required:['serviceId'],properties:{serviceId:{type:'integer'}}}}}];
+  assert.equal(await agent.runAgentUntilAnswer('Inspect service 25'), 'Environment retrieved');
+  assert.deepEqual(executed, [{serviceId:25}]);
+ });
+}
+
+
+for (const raw of [JSON.stringify('{\\"serviceId\\": 25,'), '{"serviceId":25,']) {
+ test('all recovered MCP parameters execute without regeneration: ' + raw, async () => {
+  const name='mcp__deploymate__get_service_environment'; let requests=0;
+  const {agent,executed}=server(async()=>++requests===1
+   ? {choices:[{finish_reason:'tool_calls',message:{role:'assistant',tool_calls:[{id:'recover-id',function:{name,arguments:raw}}]}}]}
+   : {choices:[{finish_reason:'stop',message:{role:'assistant',content:'Done'}}]});
+  agent.mcpRegistry.toolDefinitions=[{type:'function',function:{name,parameters:{type:'object',properties:{serviceId:{type:'integer',minimum:1}},required:['serviceId'],additionalProperties:false}}}];
+  assert.equal(await agent.runAgentUntilAnswer(),'Done');
+  assert.deepEqual(executed,[{serviceId:25}]);
+  assert.equal(requests,2);
+ });
+}
+
+test('unrecovered required fields send original JSON, recovered fields and missing names to the model', async () => {
+ const name='mcp__deploymate__update_service'; const raw='{"serviceId":25,"prompt":"unfinished'; let requests=0;
+ const {agent,executed}=server(async({messages})=>{
+  if(++requests===1) return {choices:[{finish_reason:'tool_calls',message:{role:'assistant',tool_calls:[{id:'partial',function:{name,arguments:raw}}]}}]};
+  if(requests===2) {
+   assert.deepEqual(executed,[]);
+   const text=messages.at(-1).content;
+   const [report]=JSON.parse(text.slice(text.indexOf('\n')+1));
+   assert.equal(report.rawArguments,raw);
+   assert.deepEqual(report.recoveredArguments,{serviceId:25});
+   assert.deepEqual(report.missingRequired,['prompt']);
+   assert.equal(messages.some(m=>m.tool_calls?.some(c=>c.id==='partial')),false);
+   return {choices:[{finish_reason:'tool_calls',message:{role:'assistant',tool_calls:[{id:'fresh',function:{name,arguments:'{"serviceId":25,"prompt":"Inspect logs"}'}}]}}]};
+  }
+  return {choices:[{finish_reason:'stop',message:{role:'assistant',content:'Done'}}]};
+ });
+ agent.mcpRegistry.toolDefinitions=[{type:'function',function:{name,parameters:{type:'object',properties:{serviceId:{type:'integer'},prompt:{type:'string'}},required:['serviceId','prompt']}}}];
+ assert.equal(await agent.runAgentUntilAnswer(),'Done');
+ assert.deepEqual(executed,[{serviceId:25,prompt:'Inspect logs'}]);
+});
+
+
+test('malformed required command retries with raw JSON and missing command instead of ending the turn',async()=>{
+ let requests=0;const raw='{"command":"unfinished';
+ const {agent,executed}=server(async({messages})=>{
+  if(++requests===1) return {choices:[{finish_reason:'tool_calls',message:{role:'assistant',tool_calls:[{id:'bad-command',function:{name:'run_command',arguments:raw}}]}}]};
+  if(requests===2){
+   assert.deepEqual(executed,[]);
+   const feedback=messages.at(-1).content;
+   const [report]=JSON.parse(feedback.slice(feedback.indexOf('\n')+1));
+   assert.equal(report.rawArguments,raw);
+   assert.deepEqual(report.missingRequired,['command']);
+   return {choices:[{finish_reason:'tool_calls',message:{role:'assistant',tool_calls:[{id:'fresh-command',function:{name:'run_command',arguments:'{"command":"pwd"}'}}]}}]};
+  }
+  return {choices:[{finish_reason:'stop',message:{role:'assistant',content:'Done'}}]};
+ });
+ assert.equal(await agent.runAgentUntilAnswer(),'Done');
+ assert.deepEqual(executed,[{command:'pwd'}]);
+});
+
+
+test('missing MCP parameter feedback preserves executed siblings without replaying them',async()=>{
+ const name='mcp__deploymate__get_service_environment';let requests=0;
+ const {agent,executed}=server(async({messages})=>{
+  if(++requests===1)return {choices:[{finish_reason:'tool_calls',message:{role:'assistant',tool_calls:[
+   {id:'good-sibling',function:{name,arguments:'{"serviceId":24}'}},
+   {id:'bad-sibling',function:{name,arguments:'{"serviceId":'}}
+  ]}}]};
+  if(requests===2){
+   assert.deepEqual(executed,[{serviceId:24}]);
+   assert.equal(messages.some(m=>m.tool_calls?.some(c=>c.id==='bad-sibling')),false);
+   assert.equal(messages.filter(m=>m.tool_call_id==='good-sibling').length,1);
+   return {choices:[{finish_reason:'tool_calls',message:{role:'assistant',tool_calls:[{id:'regenerated',function:{name,arguments:'{"serviceId":25}'}}]}}]};
+  }
+  return {choices:[{finish_reason:'stop',message:{role:'assistant',content:'Done'}}]};
+ });
+ agent.mcpRegistry.toolDefinitions=[{type:'function',function:{name,parameters:{type:'object',required:['serviceId'],properties:{serviceId:{type:'integer'}}}}}];
+ assert.equal(await agent.runAgentUntilAnswer(),'Done');
+ assert.deepEqual(executed,[{serviceId:24},{serviceId:25}]);
 });
