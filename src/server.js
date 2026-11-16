@@ -1,3 +1,5 @@
+import { toolValidationFeedback } from "./tool_validation_feedback.js";
+import { PlanExecution } from "./plan_execution.js";
 import OpenAI from "openai";
 import { ToolFailureRecovery, toolResultFailed, alternativeToolFeedback } from "./tool_failure_recovery.js";
 import { recoverToolArguments, parseToolArgumentObject } from "./tool_argument_recovery.js";
@@ -184,6 +186,8 @@ export function describeToolStart(name, args) {
     load_command: `Load command: /${String(args.command_name || "").replace(/^\//, "")}`,
     load_skill: `Load skill: ${args.skill_name || "(missing skill)"}`,
     load_agent_prompt: `Load agent prompt: ${args.agent_name || "(missing agent)"}`,
+    execute_plan: `Execute plan: ${args.action || "status"}`,
+    create_plan: `Create plan: ${args.title || "(missing title)"}`,
     update_todos: "Update task list",
     run_plugin_hook: `Run plugin hook: ${args.plugin_name || "(missing plugin)"}`
   };
@@ -199,7 +203,7 @@ export function describeToolDone(name, result, failed) {
 
 export function toolActionName(name) {
   const labels = {
-    browse_internet: "Fetched URL", check_system_tools: "Checked tools", list_files: "Listed files", glob_files: "Matched files", git: "Ran git", read_file: "Read file", touch_file: "Touched file", write_file: "Wrote file", edit_file: "Edited file", run_command: "Ran shell command", start_background_process: "Started background process", read_background_process: "Read background output", monitor_background_process: "Monitored background process", write_background_process: "Wrote background input", stop_background_process: "Stopped background process", list_background_processes: "Listed background processes", request_user_input: "Asked for input", record_workspace_server: "Recorded workspace server", search_files: "Searched files", list_agent_resources: "Listed resources", read_agent_resource: "Read resource", load_command: "Loaded command", load_skill: "Loaded skill", load_agent_prompt: "Loaded agent prompt", update_todos: "Updated task list", run_plugin_hook: "Ran plugin hook"
+    browse_internet: "Fetched URL", check_system_tools: "Checked tools", list_files: "Listed files", glob_files: "Matched files", git: "Ran git", read_file: "Read file", touch_file: "Touched file", write_file: "Wrote file", edit_file: "Edited file", run_command: "Ran shell command", start_background_process: "Started background process", read_background_process: "Read background output", monitor_background_process: "Monitored background process", write_background_process: "Wrote background input", stop_background_process: "Stopped background process", list_background_processes: "Listed background processes", request_user_input: "Asked for input", record_workspace_server: "Recorded workspace server", search_files: "Searched files", list_agent_resources: "Listed resources", read_agent_resource: "Read resource", load_command: "Loaded command", load_skill: "Loaded skill", load_agent_prompt: "Loaded agent prompt", execute_plan: "Executed plan", create_plan: "Created plan", update_todos: "Updated task list", run_plugin_hook: "Ran plugin hook"
   };
   return labels[name] || `Ran ${name}`;
 }
@@ -377,7 +381,15 @@ export class AgentServer {
       if (name === "git" && tools.gitRequiresApproval(command)) requiresApproval = !config.toolAllowedWithoutApproval(this.config, name, `git ${command}`);
       if (requiresApproval && !(await this.confirmToolExecution(name, args))) throw new Error("user denied command approval");
       if (name !== "load_skill") this.ui.message?.(displayCommand ? "Running tool: " + name + "\nCommand: " + displayCommand : "Running tool: " + name);
-      if (this.mcpRegistry && this.mcpRegistry.hasTool(name)) result = await this.mcpRegistry.callTool(name, args, { signal: this.currentTurn?.controller.signal });
+      this.planExecution ||= new PlanExecution(this.messages);
+      if (name === "execute_plan") {
+        result = this.planExecution.execute(args);
+        this.planExecution.save(this.messages);
+      } else if (name === "create_plan") {
+        result = tools.createPlan(args);
+        this.planExecution.create(args);
+        this.planExecution.save(this.messages);
+      } else if (this.mcpRegistry && this.mcpRegistry.hasTool(name)) result = await this.mcpRegistry.callTool(name, args, { signal: this.currentTurn?.controller.signal });
       else {
         const fn = tools.TOOLS[name];
         if (!fn) throw new Error(`unknown tool: ${name}`);
@@ -395,6 +407,7 @@ export class AgentServer {
         ? String(args.path || "").match(/(?:^|\/)skills\/([^/]+)\/SKILL\.md$/)?.[1] : null;
       const skill = name === "load_skill" ? String(args.skill_name || "").trim() : resourceSkill;
       if (skill) this.ui.message?.(`Using skill: ${skill}`);
+      if (name === "create_plan" || name === "execute_plan") this.ui.message?.(String(result));
     }
     return { role: "tool", tool_call_id: toolCall.id, content: String(result) };
   }
@@ -424,10 +437,12 @@ export class AgentServer {
   }
 
   async runAgentUntilAnswer(userGoal = "") {
+    this.planExecution ||= new PlanExecution(this.messages);
     let invalidToolRounds = 0;
     const failures = new ToolFailureRecovery();
     let lastRejectedTools = [];
     let planningRounds = 0, totalPlanningRounds = 0;
+    let unfinishedPlanReplies = 0;
     while (true) {
       this.throwIfInterrupted();
       this.flushProcessCompletions();
@@ -481,6 +496,15 @@ export class AgentServer {
       this.messages.push(message);
       if (!message.tool_calls || !message.tool_calls.length) {
         const summary = planningSummary(message.content, userGoal);
+        if (this.planExecution?.plan?.status === "running") {
+          if (++unfinishedPlanReplies <= 2) {
+            this.messages.push({role:"user",content:"The plan is still running. Continue the current step and report its verified result with execute_plan complete_step, or fail_step with exhausted alternatives and a concrete next_action for the user. Do not claim the plan is complete."});
+            continue;
+          }
+          this.planExecution.execute({action:"fail_step",step:this.planExecution.plan.current+1,reason:"The agent stopped without resolving the current step.",alternatives_tried:["Continuation requests did not produce a verified result; no further automatic attempt is available."],next_action:"Review the current step and its tool output, resolve any missing access or configuration, then ask Mate to create a revised plan."});
+          this.planExecution.save(this.messages);
+          return this.planExecution.describe();
+        }
         if (!summary) return message.content || "";
         this.ui.message(summary);
         planningRounds++;
@@ -494,8 +518,9 @@ export class AgentServer {
       planningRounds = 0;
       const summary = planningSummary(message.content, userGoal);
       if (summary) this.ui.message(summary);
-      let invalidArguments = false, exhausted = false;
+      let invalidArguments = false, exhausted = false, planFailedInBatch = false;
       const alternatives = [];
+      const validationFeedback = [];
       const rejectedTools = [];
       for (const toolCall of message.tool_calls) {
         this.throwIfInterrupted();
@@ -510,6 +535,8 @@ export class AgentServer {
           result = noToolCallMessage(toolCall, "retry limit reached for this failing request; choose another approach or independent task");
           exhausted ||= retry.exhausted;
           alternatives.push(alternativeToolFeedback([name]));
+        } else if (planFailedInBatch) {
+          result = noToolCallMessage(toolCall, "The plan failed; remaining tools in this batch were not executed.");
         } else if (missing) {
           invalidArguments ||= invalid;
           result = noToolCallMessage(toolCall, missing);
@@ -522,12 +549,16 @@ export class AgentServer {
           result = await this.toolMessage(toolCall);
         }
         this.messages.push(result);
+        const schemaFeedback = toolValidationFeedback(toolCall, result, [...tools.TOOL_DEFINITIONS, ...(this.mcpRegistry?.toolDefinitions || [])]);
+        if (schemaFeedback) validationFeedback.push(schemaFeedback);
+        planFailedInBatch ||= this.planExecution?.plan?.status === "failed";
         if (invalid) rejectedTools.push(name);
         if (!retry.blocked) {
           const feedback = failures.record(name,key,toolResultFailed(name,result));
           if (feedback) alternatives.push(feedback);
         }
       }
+      if (validationFeedback.length) this.messages.push({role:"user",content:validationFeedback.join("\n\n")});
       invalidToolRounds = invalidArguments ? invalidToolRounds + 1 : 0;
       if (invalidArguments) {
         lastRejectedTools = [...new Set(rejectedTools)];
@@ -539,6 +570,7 @@ export class AgentServer {
         this.ui.message?.("The tool retry limit was reached; the agent will look for alternatives or continue independent work.");
         invalidToolRounds = 0;
       }
+      if (this.planExecution?.plan?.status === "failed") return this.planExecution.describe();
       if (exhausted) throw new Error("Stopped after three attempts to repeat an exhausted tool request despite alternative-task guidance; the affected work remains incomplete.");
 
     }
@@ -550,7 +582,7 @@ export class AgentServer {
       this.throwIfInterrupted();
       const answer = await this.runAgentUntilAnswer(userGoal);
       this.throwIfInterrupted();
-      if (i >= maxChecks) return answer;
+      if (this.planExecution?.plan?.status === "failed" || i >= maxChecks) return answer;
       try {
         const assessment = await this.assessAnswer(userGoal, answer);
         if (assessment.aligned) return answer;
@@ -682,6 +714,6 @@ function safeToolHistory(messages) {
 function activityTypeForTool(name) {
   if (["run_command", "git", "start_background_process", "read_background_process", "monitor_background_process", "write_background_process", "stop_background_process", "list_background_processes"].includes(name)) return "command";
   if (["write_file", "edit_file", "touch_file"].includes(name)) return "files";
-  if (name === "update_todos") return "plan";
+  if (name === "update_todos" || name === "create_plan" || name === "execute_plan") return "plan";
   return "tool";
 }

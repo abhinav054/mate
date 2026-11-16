@@ -458,3 +458,42 @@ receives them before its next model request. In app-server mode, completion
 starts a follow-up turn if the agent is idle; active turns consume the event
 without overlapping another turn. Interrupting pauses automatic follow-ups
 until the next user turn.
+
+### Skill-directed planning
+
+Skills can direct Mate to call `create_plan` before starting work. The hook accepts
+`title` (string), `steps` (a non-empty array of strings), and optional `skill_name`.
+It displays the complete ordered plan in chat and returns it to the model as a
+tool result, retaining it in conversation history. It does not run commands,
+write workspace files, or require approval. Use `update_todos` to track progress.
+
+Example skill instruction: “Before creating services, call `create_plan` with
+the files to prepare, validation steps, and all production services required.”
+
+### Executing a plan
+
+After `create_plan`, call `execute_plan` with `action: "start"` when the user has
+authorized implementation. Mate executes the current step using its regular
+tools and permissions, then calls `complete_step` with the 1-based `step` and
+a verified `result`. The hook advances one step at a time and rejects skipping
+steps. `action: "status"` returns progress. Plan state is stored in conversation
+system context so compaction and resume retain it.
+
+If a step cannot be completed after safe alternatives are exhausted, call
+`fail_step` with `step`, `reason`, `alternatives_tried` (including why alternatives
+are unavailable), and `next_action`: a concrete action the user can take. The
+plan stops, later queued tools are blocked, and Mate reports the failed step and
+next action without an automatic result-check retry. Completion and exhaustion
+are reported by the model from tool evidence; the hook does not independently
+prove that arbitrary commands succeeded or discover alternatives.
+
+### Tool schema validation feedback
+
+On a tool argument/schema validation failure, the next model request includes the
+advertised input schema, paths of valid supplied fields, missing required fields,
+and unknown or invalid field paths. Argument values are not duplicated in the
+feedback. When Deploymate returns its stricter per-service configuration schema,
+Mate uses that schema. It asks the model to preserve valid values and correct the
+rejected call, inspect schema-discovery tools for unspecified nested objects,
+and report server/schema mismatches rather than guessing parameters. Existing
+retry limits still apply.

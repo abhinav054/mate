@@ -370,6 +370,16 @@ export function loadAgentPrompt({ agent_name }) {
   return loadIndexedResource("agents", (line, normalized) => line.endsWith(`/${normalized.replace(/\.md$/, "")}.md`), agent_name, "agent prompt");
 }
 
+export function createPlan({ title, steps, skill_name }) {
+  if (typeof title !== "string" || !title.trim()) throw new Error("title must be a non-empty string");
+  if (!Array.isArray(steps) || !steps.length || steps.some(step => typeof step !== "string" || !step.trim())) {
+    throw new Error("steps must be a non-empty array of non-empty strings");
+  }
+  if (skill_name !== undefined && (typeof skill_name !== "string" || !skill_name.trim())) throw new Error("skill_name must be a non-empty string when provided");
+  return [`Plan: ${title.trim()}`, ...(skill_name ? [`Skill: ${skill_name.trim()}`] : []),
+    ...steps.map((step, index) => `${index + 1}. ${step.trim()}`)].join("\n");
+}
+
 export function updateTodos({ items_json }) {
   const parsed = JSON.parse(items_json);
   if (!Array.isArray(parsed)) throw new Error("items_json must be a JSON array");
@@ -385,12 +395,27 @@ export async function runPluginHook({ plugin_name, hook_command, input_json = "{
 }
 
 export const TOOLS = {
-  browse_internet: browseInternet, check_system_tools: checkSystemTools, list_files: listFiles, glob_files: globFiles, git, read_file: readFile, touch_file: touchFile, write_file: writeFile, edit_file: editFile, record_workspace_server: recordWorkspaceServer, run_command: runCommand, start_background_process: startBackgroundProcess, list_background_processes: listBackgroundProcesses, read_background_process: readBackgroundProcess, monitor_background_process: monitorBackgroundProcess, write_background_process: writeBackgroundProcess, stop_background_process: stopBackgroundProcess, request_user_input: requestUserInput, search_files: searchFiles, list_agent_resources: listAgentResources, read_agent_resource: readAgentResource, load_command: loadCommand, load_skill: loadSkill, load_agent_prompt: loadAgentPrompt, update_todos: updateTodos, run_plugin_hook: runPluginHook
+  browse_internet: browseInternet, check_system_tools: checkSystemTools, list_files: listFiles, glob_files: globFiles, git, read_file: readFile, touch_file: touchFile, write_file: writeFile, edit_file: editFile, record_workspace_server: recordWorkspaceServer, run_command: runCommand, start_background_process: startBackgroundProcess, list_background_processes: listBackgroundProcesses, read_background_process: readBackgroundProcess, monitor_background_process: monitorBackgroundProcess, write_background_process: writeBackgroundProcess, stop_background_process: stopBackgroundProcess, request_user_input: requestUserInput, search_files: searchFiles, list_agent_resources: listAgentResources, read_agent_resource: readAgentResource, load_command: loadCommand, load_skill: loadSkill, load_agent_prompt: loadAgentPrompt, execute_plan: () => { throw new Error("execute_plan requires a Mate session"); }, create_plan: createPlan, update_todos: updateTodos, run_plugin_hook: runPluginHook
 };
 
-export const TOOL_DEFINITIONS = Object.keys(TOOLS).map((name) => ({ type: "function", function: { name, description: name === "monitor_background_process" ? "Monitor a tracked process for completion with a bounded wait. Return running or final exit status and recent stdout/stderr; call again if still running. Never restarts or kills the process." : `Run Mate tool ${name}.`, parameters: toolSchema(name) } }));
+export const TOOL_DEFINITIONS = Object.keys(TOOLS).map((name) => ({ type: "function", function: { name, description: name === "execute_plan" ? "Execute a created plan in order. Start it, use normal tools for the current step, then complete_step with verified result and 1-based step number. Try safe alternatives before fail_step; provide reason, alternatives_tried and a concrete next_action for the user when none remain. status reports progress. Never mark an unexecuted step complete." : name === "create_plan" ? "Create and display an ordered plan when directed by a skill or requested by the user. Supply the complete plan, including required files, validation and production services when applicable, before executing its actions. This hook records the plan in conversation history; it does not execute steps or grant approval." : name === "monitor_background_process" ? "Monitor a tracked process for completion with a bounded wait. Return running or final exit status and recent stdout/stderr; call again if still running. Never restarts or kills the process." : `Run Mate tool ${name}.`, parameters: toolSchema(name) } }));
 
 function toolSchema(name) {
+  if (name === "execute_plan") return {
+    type: "object", additionalProperties: false, required: ["action"], properties: {
+      action: {type:"string", enum:["start", "status", "complete_step", "fail_step"]},
+      step: {type:"integer", minimum:1}, result: {type:"string"}, reason: {type:"string"},
+      alternatives_tried: {type:"array", items:{type:"string"}}, next_action: {type:"string"}
+    }
+  };
+  if (name === "create_plan") return {
+    type: "object", additionalProperties: false, required: ["title", "steps"],
+    properties: {
+      title: { type: "string", minLength: 1 },
+      steps: { type: "array", minItems: 1, items: { type: "string", minLength: 1 } },
+      skill_name: { type: "string", minLength: 1, description: "Name of the skill directing this plan, when applicable." }
+    }
+  };
   const common = { type: "object", properties: {} };
   const schemas = {
     browse_internet: { url: "string", max_time_seconds: "integer" },

@@ -38,7 +38,7 @@ export function loadConfig(root = null) {
 export function toolRequiresApproval(config, toolName, command = "") {
   // Loading instructions is notification-only; actions in the skill retain
   // their normal tool permissions when they are executed.
-  if (toolName === "load_skill") return false;
+  if ((toolName === "load_skill" || toolName === "create_plan" || toolName === "execute_plan")) return false;
   if (toolAllowedWithoutApproval(config, toolName, command)) return false;
   if (config.approval.require_tools.has(toolName)) return true;
   return Boolean(command && matchesAny(command, config.approval.require_commands));
