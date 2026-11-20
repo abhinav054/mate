@@ -106,3 +106,11 @@ test('diff output is attached to the original file tool; exceptions close the it
   assert.equal(captured.events.at(-1).params.item.status,'failed');
   assert.equal(state.active,false);
 });
+
+test('finished background monitor calls publish a terminal background status', async () => {
+ const agent={async toolMessage(){return {role:'tool',content:'server running pid=42'};}};
+ const {events}=capture(agent);
+ await agent.toolMessage(call('monitor_background_process',{process_id:'server'}));
+ assert.equal(events[0].params.item.status,'inProgress');
+ assert.equal(events.at(-1).params.item.status,'backgrounded');
+});

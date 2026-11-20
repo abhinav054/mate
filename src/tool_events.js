@@ -48,7 +48,7 @@ export function installToolEvents(agent, publish, turn = () => null) {
     const output = bounded([content, ...state.diffs].filter(Boolean).join('\n\n'));
     item = { ...item, status: failed ? 'failed' : 'completed', durationMs: Date.now() - started };
     if (item.type === 'commandExecution') {
-      item.status = declined ? 'declined' : ['timedOut', 'backgrounded', 'inProgress'].includes(outcome.status) ? outcome.status : outcome.status === 'interrupted' || agent.currentTurn?.interrupted ? 'interrupted' : item.status;
+      item.status = declined ? 'declined' : outcome.status === 'inProgress' ? 'backgrounded' : ['timedOut', 'backgrounded'].includes(outcome.status) ? outcome.status : outcome.status === 'interrupted' || agent.currentTurn?.interrupted ? 'interrupted' : item.status;
       item.exitCode = outcome.exitCode ?? null;
       item.processId = outcome.processId ?? item.processId;
       item.aggregatedOutput = output;
